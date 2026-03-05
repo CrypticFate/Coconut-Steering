@@ -6,8 +6,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import PreTrainedTokenizerBase
-from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 
 from data.data_loader import get_hf_dataset
 from utils.helpers import clear_memory
@@ -68,7 +66,7 @@ def get_cot_latent_dataset(scheduled_stage, drop_remaining, base_dataset, config
 
 @dataclass
 class MyCollator:
-    tokenizer: PreTrainedTokenizerBase
+    tokenizer: object
     latent_id: int
     label_pad_token_id: int = -100
 
@@ -92,11 +90,22 @@ class MyCollator:
                     feature["labels"] = [self.label_pad_token_id] * pad + feature["labels"]
 
         labels = [f.pop("labels") for f in features] if "labels" in features[0] else None
-        batch = pad_without_fast_tokenizer_warning(
-            self.tokenizer, features, padding=True, return_tensors="pt"
-        )
+
+        # Manual padding (replaces pad_without_fast_tokenizer_warning)
+        max_len = max(len(f["input_ids"]) for f in features)
+        padded_input_ids = []
+        padded_attention_mask = []
+        for f in features:
+            pad_len = max_len - len(f["input_ids"])
+            padded_input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
+            padded_attention_mask.append(f["attention_mask"] + [0] * pad_len)
+
+        batch = {
+            "input_ids": torch.tensor(padded_input_ids),
+            "attention_mask": torch.tensor(padded_attention_mask),
+        }
+
         if labels:
-            max_len = batch["input_ids"].shape[1]
             batch["labels"] = torch.tensor(
                 [l + [self.label_pad_token_id] * (max_len - len(l)) for l in labels]
             )
