@@ -183,8 +183,9 @@ def initialize_qwen_model(config):
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id,
-        torch_dtype=dt,
-        trust_remote_code=True
+        dtype=dt,
+        device_map="cpu",
+        trust_remote_code=True,
     )
 
     # 2. Hardware Safeguard: Gradient Checkpointing
