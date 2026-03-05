@@ -11,7 +11,7 @@ import time
 
 import torch
 
-from configs.config import configs, set_seed
+from configs.config import Config, set_seed
 from core.evaluator import analyze_confidence, evaluate_with_iti, print_sample_outputs
 from core.extractor import extract_truth_vector
 from core.trainer import train_phase1
@@ -45,7 +45,7 @@ def main():
     print("  COCONUT + ITI Steering Pipeline")
     print("=" * 60)
 
-    config = configs
+    config = Config()
     set_seed(config.seed)
     os.makedirs(config.save_path, exist_ok=True)
 

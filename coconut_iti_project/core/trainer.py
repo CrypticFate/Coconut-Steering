@@ -2,7 +2,6 @@ import itertools
 import os
 from dataclasses import dataclass
 
-import bitsandbytes as bnb
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -105,6 +104,8 @@ class MyCollator:
 
 
 def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id):
+    import bitsandbytes as bnb  # Lazy import to prevent segfault at module load time
+
     collator = MyCollator(tokenizer, latent_id=latent_id)
     ds_phase1 = get_hf_dataset(data_phase1, tokenizer)
 

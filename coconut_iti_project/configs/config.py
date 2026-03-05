@@ -39,8 +39,18 @@ class Config:
 
         # --- ENVIRONMENT ---
         self.seed = 42
-        self.bf16 = True if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else False
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Deferred: bf16 check can segfault if called during module import
+        self._bf16 = None
+
+    @property
+    def bf16(self):
+        if self._bf16 is None:
+            try:
+                self._bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            except Exception:
+                self._bf16 = False
+        return self._bf16
 
 def set_seed(seed_value=42):
     """Sets the seed across all stochastic modules for reproducibility."""
@@ -49,7 +59,3 @@ def set_seed(seed_value=42):
     torch.manual_seed(seed_value)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_value)
-
-# Initialize a global config instance for easy importing
-configs = Config()
-set_seed(configs.seed)
