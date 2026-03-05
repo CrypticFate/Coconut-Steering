@@ -10,8 +10,6 @@ class Config:
         self.train_split_2_ratio = 0.10
         self.train_split_3_ratio = 0.30
 
-        self.max_train_samples = 2000
-
         # --- RTX 3090 Optimization: batch=8, grad_accum=16 (effective=128) ---
         self.batch_size_training = 8
         self.gradient_accumulation_steps = 16

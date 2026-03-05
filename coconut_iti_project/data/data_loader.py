@@ -33,7 +33,7 @@ def prepare_datasets(config):
     print("Loading and splitting GSM8K dataset...")
     raw_dataset = load_dataset("gsm8k", "main")
 
-    train_full = [parse_example(ex) for ex in raw_dataset["train"]][:config.max_train_samples]
+    train_full = [parse_example(ex) for ex in raw_dataset["train"]]
 
     total_samples = len(train_full)
     idx_phase1_end = int(total_samples * config.train_split_1_ratio)
