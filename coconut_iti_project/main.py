@@ -1,16 +1,23 @@
-import argparse
 import os
+
+# --- Must be set BEFORE any library imports to prevent TF/PyTorch CUDA conflict ---
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"           # Suppress TF logging entirely
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"           # Disable oneDNN ops
+os.environ["CUDA_MODULE_LOADING"] = "LAZY"           # Lazy CUDA module loading
+os.environ["TOKENIZERS_PARALLELISM"] = "false"        # Prevent tokenizer deadlocks
+
+import argparse
 import time
 
 import torch
 
-from configs.config import Config
+from configs.config import configs, set_seed
 from core.evaluator import analyze_confidence, evaluate_with_iti, print_sample_outputs
 from core.extractor import extract_truth_vector
 from core.trainer import train_phase1
 from data.data_loader import prepare_datasets
-from models.coconut import initialize_model
-from utils.helpers import clear_memory, set_seed
+from models.coconut import initialize_qwen_model
+from utils.helpers import clear_memory
 from utils.visualizer import plot_latent_pca, plot_loss_curve
 
 
@@ -32,16 +39,13 @@ def main():
     )
     args = parser.parse_args()
 
-    # Disable tokenizer parallelism to prevent deadlocks
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
     pipeline_start = time.time()
 
     print("=" * 60)
     print("  COCONUT + ITI Steering Pipeline")
     print("=" * 60)
 
-    config = Config()
+    config = configs
     set_seed(config.seed)
     os.makedirs(config.save_path, exist_ok=True)
 
@@ -63,7 +67,7 @@ def main():
     print("\n" + "-" * 60)
     print("  Initializing Model")
     print("-" * 60)
-    coconut_model, tokenizer, latent_id, start_id, end_id = initialize_model(config)
+    coconut_model, tokenizer, latent_id, start_id, end_id = initialize_qwen_model(config)
 
     # =========================================================
     # Phase 1: Silent Thinking (Base Training)

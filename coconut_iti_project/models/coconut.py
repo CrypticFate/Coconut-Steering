@@ -11,11 +11,18 @@ Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits", "latent_sequ
 
 
 class Coconut(nn.Module):
-    def __init__(self, base_causallm, latent_token_id, start_latent_id, end_latent_id, eos_token_id):
+    """
+    The custom wrapper that intercepts the forward pass to enable
+    Continuous Chain-of-Thought and Inference-Time Intervention.
+    """
+    def __init__(self, model, latent_id, start_id, end_id, pad_id):
         super().__init__()
-        self.base_causallm = base_causallm
-        self.latent_token_id = latent_token_id
-        self.eos_token_id = eos_token_id
+        self.base_causallm = model
+        self.latent_token_id = latent_id
+        self.start_id = start_id
+        self.end_id = end_id
+        self.pad_id = pad_id
+        self.eos_token_id = pad_id  # pad_token = eos_token for Qwen
         self.embedding = self.base_causallm.get_input_embeddings()
 
     def _process_kv(self, kv_cache, keep_len):
@@ -36,6 +43,10 @@ class Coconut(nn.Module):
 
     def forward(self, input_ids, attention_mask, labels=None, position_ids=None,
                 steering_vector=None, alpha=0.0, gamma=1.0):
+        """
+        Custom forward pass that routes hidden states through continuous thought
+        and applies ITI steering: h_new = h_old + (alpha * sigma * v_truth)
+        """
         logits = []
         latent_sequence = []
 
@@ -69,7 +80,7 @@ class Coconut(nn.Module):
 
             hidden_states = outputs.hidden_states[-1]
 
-            # --- Dynamic Alpha Decay ---
+            # --- Dynamic Alpha Decay ITI ---
             if steering_vector is not None and alpha > 0:
                 current_alpha = alpha * (gamma ** pass_idx)
                 sigma_l = hidden_states.std(dim=-1, keepdim=True)
@@ -105,6 +116,7 @@ class Coconut(nn.Module):
 
     def generate_with_latents(self, input_ids, max_new_tokens=128, temperature=0.0,
                               steering_vector=None, alpha=0.0, gamma=1.0):
+        """Deterministic generation with continuous thought and optional ITI steering."""
         self.eval()
         tokens = input_ids.tolist()[0]
 
@@ -159,30 +171,54 @@ class Coconut(nn.Module):
         return torch.tensor([tokens]), mean_latent, avg_faithfulness
 
 
-def initialize_model(config):
-    print("Initializing Qwen Model...")
+def initialize_qwen_model(config):
+    """
+    Safely loads Qwen2.5-3B-Instruct into the RTX 3090 with strict
+    memory optimizations and initializes the continuous thought tokens.
+    """
+    print(f"Loading {config.model_id} in bfloat16...")
+
+    # 1. Hardware Safeguard: Strict bfloat16 casting to cut memory in half
     dt = torch.bfloat16 if config.bf16 else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(config.model_id, torch_dtype=dt, trust_remote_code=True)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_id,
+        torch_dtype=dt,
+        trust_remote_code=True
+    )
+
+    # 2. Hardware Safeguard: Gradient Checkpointing
+    # This trades compute for memory, allowing the 3B model to fit in 24GB during backprop.
     model.gradient_checkpointing_enable()
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_id, trust_remote_code=True)
+
+    # Qwen-specific padding setup
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # 3. Inject Latent Vocabulary
     tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>", "<|latent|>"])
     latent_id, start_id, end_id = tokenizer.convert_tokens_to_ids(
         ["<|latent|>", "<|start-latent|>", "<|end-latent|>"]
     )
+
     model.resize_token_embeddings(len(tokenizer))
 
+    # 4. Initialize Latent Weights
+    # We clone the embedding weights of a common word to give the latent token a stable starting point
     with torch.no_grad():
         input_embeds = model.get_input_embeddings()
         init_id = tokenizer.encode("The", add_special_tokens=False)[0]
+
         input_embeds.weight.data[latent_id] = input_embeds.weight.data[init_id].clone()
-        if hasattr(model, "lm_head") and model.lm_head is not None:
+
+        if hasattr(model, 'lm_head') and model.lm_head is not None:
             model.lm_head.weight.data[latent_id] = model.lm_head.weight.data[init_id].clone()
+
         input_embeds.weight.requires_grad = True
 
-    coconut_model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id).to(config.device)
+    # Wrap the base model in your custom COCONUT architecture
+    coconut_model = Coconut(model, latent_id, start_id, end_id, tokenizer.pad_token_id).to(config.device)
 
     return coconut_model, tokenizer, latent_id, start_id, end_id
