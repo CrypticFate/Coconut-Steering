@@ -1,0 +1,10 @@
+torch>=2.1.0
+transformers
+datasets
+bitsandbytes
+accelerate
+plotly
+scikit-learn
+tqdm
+matplotlib
+numpy
