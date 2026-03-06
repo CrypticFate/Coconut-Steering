@@ -14,7 +14,7 @@ def extract_truth_vector(coconut_model, data_phase2, tokenizer, config, latent_i
     ds_phase2 = get_hf_dataset(data_phase2, tokenizer)
     correct_latents = []
     wrong_latents = []
-    n_latents_infer = config.max_latent_stage * config.c_thought
+    n_latents_infer = config.max_latent_tokens
 
     for sample in tqdm(ds_phase2, desc="Phase 2 Inference"):
         prompt = (

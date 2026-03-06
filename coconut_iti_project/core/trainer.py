@@ -12,55 +12,71 @@ from utils.helpers import clear_memory
 
 
 def get_stage_info(epoch):
-    if epoch < 6:
+    # Finer-grained curriculum for 24 epochs
+    # Each stage drops 4 more tokens and adds 1 more latent token
+    # Stages 0-6: progressive token dropping (3 epochs each = 21 epochs)
+    # Epochs 21-23: drop_remaining = True (full latent mode)
+    if epoch < 3:
         return 0, False, (epoch == 0)
+    elif epoch < 6:
+        return 1, False, (epoch == 3)
     elif epoch < 9:
-        return 1, False, (epoch == 6)
+        return 2, False, (epoch == 6)
     elif epoch < 12:
-        return 2, False, (epoch == 9)
+        return 3, False, (epoch == 9)
     elif epoch < 15:
-        return 3, False, (epoch == 12)
+        return 4, False, (epoch == 12)
+    elif epoch < 18:
+        return 5, False, (epoch == 15)
+    elif epoch < 21:
+        return 6, False, (epoch == 18)
     else:
-        return 3, True, (epoch == 15)
+        return 6, True, (epoch == 21)
 
 
-def get_cot_latent_dataset(scheduled_stage, drop_remaining, base_dataset, config,
+def get_cot_latent_dataset(scheduled_stage, drop_remaining, base_dataset, configs,
                            start_id, latent_id, end_id, shuffle=False):
     def process_dataset(sample):
-        n_steps_total = len(sample["steps_tokenized"])
-        n_steps_to_latentize = min(scheduled_stage, n_steps_total)
-        if n_steps_to_latentize > config.max_latent_stage:
-            n_steps_to_latentize = config.max_latent_stage
+        # --- HYBRID ARCHITECTURE ---
+        # We extract Step 1 and force it to remain in English as the "Reasoning Skeleton"
+        if len(sample["steps_tokenized"]) > 0 and configs.hybrid_mode:
+            skeleton_text = sample["steps_tokenized"][0]
+            remaining_steps = list(itertools.chain.from_iterable(sample["steps_tokenized"][1:]))
+        else:
+            skeleton_text = []
+            remaining_steps = list(itertools.chain.from_iterable(sample["steps_tokenized"]))
 
-        n_latent_tokens = n_steps_to_latentize * config.c_thought
+        # --- FINER-GRAINED CURRICULUM ---
+        # Instead of dropping whole sentences, we drop a few tokens at a time
+        tokens_to_drop = min(scheduled_stage * configs.drop_tokens_per_stage, len(remaining_steps))
 
         if drop_remaining:
-            remaining_steps = []
+            kept_remaining_text = []
         else:
-            remaining_steps = list(itertools.chain.from_iterable(
-                sample["steps_tokenized"][n_steps_to_latentize:]
-            ))
+            kept_remaining_text = remaining_steps[tokens_to_drop:]
 
-        tokens = (
-            sample["question_tokenized"]
-            + [start_id]
-            + [latent_id] * n_latent_tokens
-            + [end_id]
-            + remaining_steps
-            + sample["answer_tokenized"]
-        )
+        n_latent_tokens = min(scheduled_stage * configs.c_thought, configs.max_latent_tokens)
 
-        mask_len = len(sample["question_tokenized"]) + n_latent_tokens + 2
+        # Build the final hybrid sequence: [Question] -> [Skeleton Text] -> <bot> [Latents] <eot> -> [Remaining Text]
+        tokens = (sample["question_tokenized"] +
+                  skeleton_text +
+                  [start_id] + [latent_id] * n_latent_tokens + [end_id] +
+                  kept_remaining_text +
+                  sample["answer_tokenized"])
+
+        # Mask the loss for the Question, the Skeleton, and the Latents.
+        # The model only learns to predict the text coming AFTER the silent thoughts.
+        mask_len = len(sample["question_tokenized"]) + len(skeleton_text) + n_latent_tokens + 2
         labels = [-100] * mask_len + tokens[mask_len:]
 
-        tokens = tokens[:config.max_seq_len]
-        labels = labels[:config.max_seq_len]
+        tokens = tokens[:configs.max_seq_len]
+        labels = labels[:configs.max_seq_len]
 
         return {"input_ids": tokens, "labels": labels, "attention_mask": [1] * len(tokens)}
 
     dataset = base_dataset.map(process_dataset, remove_columns=list(base_dataset.features))
     if shuffle:
-        dataset = dataset.shuffle(seed=config.seed)
+        dataset = dataset.shuffle(seed=configs.seed)
     return dataset
 
 

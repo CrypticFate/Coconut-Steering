@@ -16,7 +16,7 @@ from core.evaluator import analyze_confidence, evaluate_with_iti, print_sample_o
 from core.extractor import extract_truth_vector
 from core.trainer import train_phase1
 from data.data_loader import prepare_datasets
-from models.coconut import initialize_qwen_model
+from models.coconut import initialize_model
 from utils.helpers import clear_memory
 from utils.visualizer import plot_latent_pca, plot_loss_curve
 
@@ -67,7 +67,7 @@ def main():
     print("\n" + "-" * 60)
     print("  Initializing Model")
     print("-" * 60)
-    coconut_model, tokenizer, latent_id, start_id, end_id = initialize_qwen_model(config)
+    coconut_model, tokenizer, latent_id, start_id, end_id = initialize_model(config)
 
     # =========================================================
     # Phase 1: Silent Thinking (Base Training)

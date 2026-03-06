@@ -29,7 +29,7 @@ from utils.visualizer import plot_latent_pca, plot_loss_curve
 print("OK")
 
 print("5. importing models.coconut ...", end=" ")
-from models.coconut import initialize_qwen_model
+from models.coconut import initialize_model
 print("OK")
 
 print("6. importing core.trainer ...", end=" ")

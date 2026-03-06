@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 def print_sample_outputs(model, tokenizer, dataset, config, num_samples=2, phase_name=""):
     print(f"\n{'=' * 20} {phase_name} OUTPUT CHECK {'=' * 20}")
     model.eval()
-    n_latents = config.max_latent_stage * config.c_thought
+    n_latents = config.max_latent_tokens
 
     sample_indices = [0, 1] if len(dataset) >= 2 else range(len(dataset))
 
@@ -49,7 +49,7 @@ def evaluate_with_iti(coconut_model, test_data, tokenizer, config, truth_vector,
     coconut_model.eval()
 
     eval_subset = test_data
-    n_latents_infer = config.max_latent_stage * config.c_thought
+    n_latents_infer = config.max_latent_tokens
 
     baseline_correctness = []
     experiment_results = []
@@ -132,7 +132,7 @@ def analyze_confidence(coconut_model, test_data, tokenizer, config, truth_vector
     print("Running Single-Sample Confidence Analysis...")
     coconut_model.eval()
 
-    n_latents_infer = config.max_latent_stage * config.c_thought
+    n_latents_infer = config.max_latent_tokens
     sample = test_data[0]
     prompt = (
         sample["question"]
