@@ -22,7 +22,7 @@ class Coconut(nn.Module):
         self.start_id = start_id
         self.end_id = end_id
         self.pad_id = pad_id
-        self.eos_token_id = pad_id  # pad_token = eos_token for GPT-2
+        self.eos_token_id = pad_id  # pad_token = eos_token (set during initialization)
         self.embedding = self.base_causallm.get_input_embeddings()
 
     def _process_kv(self, kv_cache, keep_len):
@@ -172,30 +172,39 @@ class Coconut(nn.Module):
 
 
 def initialize_model(config):
-    print(f"Loading {config.model_id}...")
+    print("Initializing Llama-3.2-3B for Phase 1...")
 
-    # GPT-2 loads perfectly in float32
-    model = AutoModelForCausalLM.from_pretrained(config.model_id, torch_dtype=torch.float32)
+    # 1. HARDWARE SAFEGUARD: bfloat16 + Eager Attention
+    dt = torch.bfloat16 if config.bf16 else torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_id,
+        torch_dtype=dt,
+        attn_implementation="eager",  # Bypasses the SDPA mask dimension crash
+        device_map="auto",  # Let accelerate handle optimal placement on the 3090
+    )
+
+    # 2. HARDWARE SAFEGUARD: Gradient Checkpointing
     model.gradient_checkpointing_enable()
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_id)
 
-    # GPT-2 does not have a pad token by default
+    # 3. LLAMA TOKENIZER FIX: Llama 3 does not have a native pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.eos_token_id
 
     # Inject Latent Vocabulary
     tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>", "<|latent|>"])
     latent_id, start_id, end_id = tokenizer.convert_tokens_to_ids(
         ["<|latent|>", "<|start-latent|>", "<|end-latent|>"]
     )
-
     model.resize_token_embeddings(len(tokenizer))
 
-    # Initialize Latent Weights
+    # Initialize Latent Weights by cloning the embedding for "The"
     with torch.no_grad():
         input_embeds = model.get_input_embeddings()
-        init_id = tokenizer.encode("The", add_special_tokens=False)[0]
+        init_id = tokenizer.encode("The", add_special_tokens=False)[-1]
 
         input_embeds.weight.data[latent_id] = input_embeds.weight.data[init_id].clone()
 
@@ -204,6 +213,7 @@ def initialize_model(config):
 
         input_embeds.weight.requires_grad = True
 
-    coconut_model = Coconut(model, latent_id, start_id, end_id, tokenizer.pad_token_id).to(config.device)
+    # Initialize the custom wrapper (model already on GPU via device_map="auto")
+    coconut_model = Coconut(model, latent_id, start_id, end_id, tokenizer.pad_token_id)
 
     return coconut_model, tokenizer, latent_id, start_id, end_id
