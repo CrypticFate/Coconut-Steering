@@ -17,7 +17,7 @@ from core.extractor import extract_truth_vector
 from core.trainer import train_phase1
 from data.data_loader import prepare_datasets
 from models.coconut import initialize_model
-from utils.helpers import clear_memory
+from utils.helpers import clear_memory, save_phase_log
 from utils.visualizer import plot_latent_pca, plot_loss_curve
 
 
@@ -85,11 +85,31 @@ def main():
 
         plot_loss_curve(loss_history, os.path.join(config.save_path, "loss_curve.png"))
         print_sample_outputs(coconut_model, tokenizer, test_data, config, phase_name="PHASE 1 (BASE)")
+
+        save_phase_log(config.save_path, 1, "SILENT THINKING (Base COCONUT Training)", (
+            f"Model: {config.model_id}\n"
+            f"Epochs: {config.num_epochs_phase1}\n"
+            f"Learning Rate: {config.lr}\n"
+            f"Batch Size: {config.batch_size_training} x {config.gradient_accumulation_steps} "
+            f"= {config.batch_size_training * config.gradient_accumulation_steps} effective\n"
+            f"Max Seq Length: {config.max_seq_len}\n"
+            f"BF16: {config.bf16}\n"
+            f"Training Samples: {len(data_phase1)}\n"
+            f"Final Loss: {loss_history[-1]:.6f}\n"
+            f"Min Loss: {min(loss_history):.6f}\n"
+            f"Duration: {phase1_time / 60:.1f} minutes\n"
+            f"Checkpoint: {os.path.join(config.save_path, 'coconut_phase1.pt')}\n"
+        ))
     else:
         checkpoint_path = os.path.join(config.save_path, "coconut_phase1.pt")
         print(f"[SKIP] Loading Phase 1 checkpoint from {checkpoint_path}...")
         coconut_model.load_state_dict(torch.load(checkpoint_path, map_location=config.device))
         print("[SKIP] Checkpoint loaded successfully.")
+
+        save_phase_log(config.save_path, 1, "SILENT THINKING (Base COCONUT Training)", (
+            f"SKIPPED: Loaded from checkpoint\n"
+            f"Checkpoint: {checkpoint_path}\n"
+        ))
 
     clear_memory()
 
@@ -107,11 +127,27 @@ def main():
         print(f"\nPhase 2 completed in {phase2_time / 60:.1f} minutes")
 
         plot_latent_pca(correct_latents, wrong_latents, os.path.join(config.save_path, "pca_latents.html"))
+
+        save_phase_log(config.save_path, 2, "MIND READING (Global Truth Vector Extraction)", (
+            f"Extraction Samples: {len(data_phase2)}\n"
+            f"Correct Latent Paths: {len(correct_latents)}\n"
+            f"Incorrect Latent Paths: {len(wrong_latents)}\n"
+            f"Truth Vector Shape: {truth_vector.shape}\n"
+            f"Truth Vector L2 Norm: {torch.norm(truth_vector).item():.6f}\n"
+            f"Duration: {phase2_time / 60:.1f} minutes\n"
+            f"Vector Saved: {os.path.join(config.save_path, 'truth_vector.pt')}\n"
+        ))
     else:
         vector_path = os.path.join(config.save_path, "truth_vector.pt")
         print(f"[SKIP] Loading truth vector from {vector_path}...")
         truth_vector = torch.load(vector_path, map_location=config.device)
         print(f"[SKIP] Truth vector loaded. Shape: {truth_vector.shape}")
+
+        save_phase_log(config.save_path, 2, "MIND READING (Global Truth Vector Extraction)", (
+            f"SKIPPED: Loaded from file\n"
+            f"Vector Path: {vector_path}\n"
+            f"Truth Vector Shape: {truth_vector.shape}\n"
+        ))
 
     clear_memory()
 
@@ -123,6 +159,13 @@ def main():
     print(f"Alpha decay (gamma): {config.alpha_decay}")
     print(f"Intervention formula: h_new = h_old + (alpha * sigma * v_truth)")
     print("Phase 3 logic is built into the model architecture -- no separate step needed.")
+
+    save_phase_log(config.save_path, 3, "MIND CONTROL (Intervention Setup)", (
+        f"Alpha Decay (gamma): {config.alpha_decay}\n"
+        f"Alpha Sweep Values: {config.alpha_sweep}\n"
+        f"Intervention Formula: h_new = h_old + (alpha * sigma * v_truth)\n"
+        f"Note: Steering logic is embedded in the Coconut forward pass.\n"
+    ))
 
     # =========================================================
     # Phase 4: Final Exam (Evaluation with ITI)
@@ -142,6 +185,23 @@ def main():
     print("-" * 60)
     analyze_confidence(coconut_model, test_data, tokenizer, config, truth_vector, latent_id)
 
+    # Build Phase 4 log content from experiment results
+    phase4_lines = [
+        f"Test Samples: {len(test_data)}\n",
+        f"Alpha Sweep: {config.alpha_sweep}\n",
+        f"Alpha Decay (gamma): {config.alpha_decay}\n",
+        f"Duration: {phase4_time / 60:.1f} minutes\n\n",
+        f"{'Alpha':<8} | {'Accuracy':<10} | {'Flip Rate':<10} | {'Faithfulness'}\n",
+        "-" * 50 + "\n",
+    ]
+    for res in experiment_results:
+        phase4_lines.append(
+            f"{res['alpha']:<8} | {res['accuracy']:.2%}     | "
+            f"{res['flip_rate']:.2%}     | {res['trajectory_faithfulness']:.4f}\n"
+        )
+    save_phase_log(config.save_path, 4, "FINAL EXAM (Inference-Time Intervention Evaluation)",
+                   "".join(phase4_lines))
+
     # --- Summary ---
     total_time = time.time() - pipeline_start
     print("\n" + "=" * 60)
@@ -151,6 +211,20 @@ def main():
     print(f"Checkpoints saved to: {os.path.abspath(config.save_path)}")
     print(f"Loss curve: {os.path.join(config.save_path, 'loss_curve.png')}")
     print(f"PCA plot: {os.path.join(config.save_path, 'pca_latents.html')}")
+
+    # Pipeline summary log
+    save_phase_log(config.save_path, 0, "PIPELINE SUMMARY", (
+        f"Model: {config.model_id}\n"
+        f"Device: {config.device}\n"
+        f"BF16: {config.bf16}\n"
+        f"Total Runtime: {total_time / 60:.1f} minutes\n"
+        f"Checkpoints Directory: {os.path.abspath(config.save_path)}\n\n"
+        f"Log Files:\n"
+        f"  - {os.path.join(config.save_path, 'phase1_log.txt')}\n"
+        f"  - {os.path.join(config.save_path, 'phase2_log.txt')}\n"
+        f"  - {os.path.join(config.save_path, 'phase3_log.txt')}\n"
+        f"  - {os.path.join(config.save_path, 'phase4_log.txt')}\n"
+    ))
 
 
 if __name__ == "__main__":
