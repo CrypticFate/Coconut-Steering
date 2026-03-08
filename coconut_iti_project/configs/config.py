@@ -4,9 +4,9 @@ import numpy as np
 
 class Config:
     def __init__(self):
-        # --- 1. THE LLAMA 3.2 UPGRADE ---
-        self.model_id = "meta-llama/Llama-3.2-3B"
-        self.save_path = "./checkpoints_coconut_steered"
+        # --- 1. THE PHI-2 UPGRADE ---
+        self.model_id = "microsoft/phi-2"
+        self.save_path = "./checkpoints_coconut_phi2"
 
         self.train_split_1_ratio = 0.60
         self.train_split_2_ratio = 0.10
@@ -35,7 +35,7 @@ class Config:
         self.alpha_decay = 0.95
 
         self.seed = 42
-        self.bf16 = True # STRICTLY ENABLED: Llama 3 requires bfloat16
+        self.bf16 = True # STRICTLY ENABLED: Phi-2 trains best in bfloat16
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
 configs = Config()

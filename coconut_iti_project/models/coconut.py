@@ -172,7 +172,7 @@ class Coconut(nn.Module):
 
 
 def initialize_model(config):
-    print("Initializing Llama-3.2-3B for Phase 1...")
+    print("Initializing Phi-2 for Phase 1...")
 
     # 1. HARDWARE SAFEGUARD: bfloat16 + Eager Attention
     dt = torch.bfloat16 if config.bf16 else torch.float32
@@ -181,15 +181,16 @@ def initialize_model(config):
         config.model_id,
         torch_dtype=dt,
         attn_implementation="eager",  # Bypasses the SDPA mask dimension crash
-        device_map="auto",  # Let accelerate handle optimal placement on the 3090
+        trust_remote_code=True,       # Phi-2 sometimes requires remote code trust
+        device_map="auto",
     )
 
     # 2. HARDWARE SAFEGUARD: Gradient Checkpointing
     model.gradient_checkpointing_enable()
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_id, trust_remote_code=True)
 
-    # 3. LLAMA TOKENIZER FIX: Llama 3 does not have a native pad token
+    # 3. PHI-2 TOKENIZER FIX: Phi-2 does not have a native pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = tokenizer.eos_token_id
@@ -204,7 +205,7 @@ def initialize_model(config):
     # Initialize Latent Weights by cloning the embedding for "The"
     with torch.no_grad():
         input_embeds = model.get_input_embeddings()
-        init_id = tokenizer.encode("The", add_special_tokens=False)[-1]
+        init_id = tokenizer.encode("The", add_special_tokens=False)[0]
 
         input_embeds.weight.data[latent_id] = input_embeds.weight.data[init_id].clone()
 
