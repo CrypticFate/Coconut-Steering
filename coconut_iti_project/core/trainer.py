@@ -123,12 +123,13 @@ class MyCollator:
 
 def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id):
     """
-    Full-parameter multi-stage COCONUT training.
+    Stable LoRA multi-stage COCONUT training with warmup.
     
-    Uses AdamW8bit for full-parameter optimization with:
+    Uses AdamW8bit for LoRA adapter optimization with:
     - 10% linear warmup scheduler per stage to prevent initial overshooting
-    - Tight gradient clipping (max_norm=0.3) to prevent optimizer derailment
+    - Gradient clipping (max_norm=1.0) to prevent optimizer derailment
     - torch.amp.autocast for bfloat16 mixed precision
+    - Only trainable (LoRA) parameters passed to optimizer
     """
     import bitsandbytes as bnb  # Lazy import to prevent segfault at module load time
 
@@ -139,7 +140,7 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
     scheduler = None
     loss_history = []
 
-    print("Starting FULL PARAMETER Multi-Stage COCONUT Training...")
+    print("Starting Multi-Stage COCONUT Training with Stable LoRA & Warmup...")
     for epoch in range(config.num_epochs_total):
 
         current_stage, drop_remaining, requires_reset = get_stage_info(epoch)
@@ -155,13 +156,14 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
         if requires_reset or optimizer is None:
             print(f"\n[Epoch {epoch}] Stage shifted to {current_stage}. "
                   f"Hard resetting AdamW Optimizer & Scheduler...")
-            # Full-parameter optimizer: ALL parameters, not just LoRA adapters
+            # Only pass the safe LoRA parameters to the 8-bit optimizer
             optimizer = bnb.optim.AdamW8bit(
-                coconut_model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+                filter(lambda p: p.requires_grad, coconut_model.parameters()),
+                lr=config.lr, weight_decay=config.weight_decay
             )
 
-            # Calculate warmup steps for this stage
-            epochs_in_stage = 3 if current_stage < 4 else (config.num_epochs_total - 15)
+            # Learning Rate Scheduler to Warmup the math
+            epochs_in_stage = 3 if current_stage < 4 else (config.num_epochs_total - 12)
             total_steps_in_stage = (len(train_loader) * epochs_in_stage) // config.gradient_accumulation_steps
             warmup_steps = max(10, int(total_steps_in_stage * 0.1))
 
@@ -190,8 +192,7 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
             loss.backward()
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
-                # Tighter gradient clipping to prevent optimizer derailment
-                nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=0.3)
+                torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=1.0)
                 
                 optimizer.step()
                 scheduler.step()

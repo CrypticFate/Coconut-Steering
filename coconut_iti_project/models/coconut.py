@@ -17,7 +17,7 @@ class Coconut(nn.Module):
     Continuous Chain-of-Thought and Inference-Time Intervention.
     
     Implements the Qwen RoPE position_ids fix and float32 loss casting
-    for numerical stability during full-parameter training.
+    for numerical stability during LoRA fine-tuning.
     """
     def __init__(self, base_causallm, latent_token_id, start_latent_id, end_latent_id, eos_token_id):
         super().__init__()
@@ -113,11 +113,11 @@ class Coconut(nn.Module):
         logits.append(outputs.logits)
         logits = torch.cat(logits, dim=-2)
         
-        # FP32 loss cast for numerical stability during full-parameter bfloat16 training
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            # Strict FP32 upcasting to prevent CrossEntropy explosion
             loss = CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)).to(torch.float32), shift_labels.view(-1))
 
         return Outputs(loss, inputs_embeds, logits, latent_sequence)
@@ -181,12 +181,16 @@ class Coconut(nn.Module):
 
 def initialize_model(config):
     """
-    Initialize Qwen 3B for full-parameter training.
+    Initialize Qwen 3B with LoRA for stable fine-tuning.
     
-    No LoRA, no gradient checkpointing. Uses .to(device) instead of device_map="auto"
-    to keep all parameters on a single GPU for full backprop.
+    Uses LoRA to freeze base weights and prevent gradient explosion from
+    8-bit optimizer rounding errors compounding across 3B parameters.
+    Initializes ALL custom tokens (latent, start, end) to prevent
+    initial hidden state corruption.
     """
-    print(f"Initializing {config.model_id} for Full-Parameter Phase 1...")
+    from peft import LoraConfig, get_peft_model
+
+    print(f"Initializing {config.model_id} with Stable LoRA...")
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id, 
@@ -215,7 +219,19 @@ def initialize_model(config):
             if hasattr(model, 'lm_head') and model.lm_head is not None:
                 model.lm_head.weight.data[new_token_id] = model.lm_head.weight.data[init_id].clone()
 
-        input_embeds.weight.requires_grad = True
+    # ====================================================================
+    # SAFE LORA ARCHITECTURE: Protects the base weights from explosion
+    # ====================================================================
+    lora_config = LoraConfig(
+        r=32, 
+        lora_alpha=64,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    # ====================================================================
 
     coconut_model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id).to(config.device)
 

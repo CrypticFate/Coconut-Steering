@@ -3,6 +3,7 @@ transformers
 datasets
 bitsandbytes
 accelerate
+peft
 plotly
 scikit-learn
 tqdm

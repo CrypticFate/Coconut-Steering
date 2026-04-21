@@ -5,20 +5,18 @@ import os
 
 class Config:
     def __init__(self):
-        # --- THE 24GB VRAM ENGINE ---
+        # Pointing to your local offline model folder
         self.model_id = "./qwen-3b-local" 
-        self.save_path = "./checkpoints_coconut_qwen3b_full"
+        self.save_path = "./checkpoints_coconut_qwen3b_lora"
         
-        # Keep physical batch at 1 to prevent OOM during full-parameter backprop
         self.batch_size_training = 1       
         self.gradient_accumulation_steps = 128
         self.max_seq_len = 512             
         
-        # Lower LR for full-parameter tuning stability
-        self.lr = 5e-6
+        # Standard LoRA Learning Rate
+        self.lr = 1e-4  
         self.weight_decay = 0.01
         
-        # --- COCONUT CURRICULUM ---
         self.hybrid_mode = True           
         self.c_thought = 2                 
         self.max_latent_tokens = 6         
