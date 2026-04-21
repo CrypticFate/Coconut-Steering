@@ -49,7 +49,7 @@ def log_phase(phase_num, phase_name):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="COCONUT ITI Pipeline (Qwen 3B Stable LoRA)")
+    parser = argparse.ArgumentParser(description="COCONUT ITI Pipeline (Qwen 3B Full Parameter)")
     parser.add_argument(
         "--skip-phase1", action="store_true",
         help="Skip Phase 1 training and load checkpoint from checkpoints/coconut_phase1.pt",
@@ -72,7 +72,7 @@ def main():
     pipeline_start = time.time()
 
     print("=" * 60)
-    print("  COCONUT + ITI Steering Pipeline (Qwen 3B Stable LoRA)")
+    print("  COCONUT + ITI Steering Pipeline (Qwen 3B Full Parameter)")
     print("=" * 60)
 
     print(f"\nDevice: {config.device}")
@@ -98,7 +98,7 @@ def main():
     # =========================================================
     # Phase 1: Silent Thinking (Base Training)
     # =========================================================
-    log_phase(1, "SILENT THINKING (Stable LoRA COCONUT Training)")
+    log_phase(1, "SILENT THINKING (Full Parameter COCONUT Training)")
 
     if not args.skip_phase1:
         phase1_start = time.time()
@@ -112,9 +112,9 @@ def main():
         plot_loss_curve(loss_history, os.path.join(config.save_path, "loss_curve.png"))
         print_sample_outputs(coconut_model, tokenizer, test_data, config, phase_name="PHASE 1 (BASE)")
 
-        save_phase_log(config.save_path, 1, "SILENT THINKING (Stable LoRA COCONUT Training)", (
+        save_phase_log(config.save_path, 1, "SILENT THINKING (Full Parameter COCONUT Training)", (
             f"Model: {config.model_id}\n"
-            f"Training Mode: Stable LoRA (r=32, alpha=64)\n"
+            f"Training Mode: Full Parameter (AdamW8bit)\n"
             f"Epochs: {config.num_epochs_total}\n"
             f"Learning Rate: {config.lr}\n"
             f"Batch Size: {config.batch_size_training} x {config.gradient_accumulation_steps} "
@@ -133,7 +133,7 @@ def main():
         coconut_model.load_state_dict(torch.load(checkpoint_path, map_location=config.device))
         print("[SKIP] Checkpoint loaded successfully.")
 
-        save_phase_log(config.save_path, 1, "SILENT THINKING (Stable LoRA COCONUT Training)", (
+        save_phase_log(config.save_path, 1, "SILENT THINKING (Full Parameter COCONUT Training)", (
             f"SKIPPED: Loaded from checkpoint\n"
             f"Checkpoint: {checkpoint_path}\n"
         ))
@@ -244,7 +244,7 @@ def main():
     # Pipeline summary log
     save_phase_log(config.save_path, 0, "PIPELINE SUMMARY", (
         f"Model: {config.model_id}\n"
-        f"Training Mode: Stable LoRA (r=32, alpha=64)\n"
+        f"Training Mode: Full Parameter (AdamW8bit)\n"
         f"Device: {config.device}\n"
         f"BF16: {config.bf16}\n"
         f"Total Runtime: {total_time / 60:.1f} minutes\n"

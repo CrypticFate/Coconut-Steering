@@ -123,15 +123,11 @@ class MyCollator:
 
 def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id):
     """
-    Stable LoRA multi-stage COCONUT training with warmup.
-    
-    Uses AdamW8bit for LoRA adapter optimization with:
-    - 10% linear warmup scheduler per stage to prevent initial overshooting
-    - Gradient clipping (max_norm=1.0) to prevent optimizer derailment
-    - torch.amp.autocast for bfloat16 mixed precision
-    - Only trainable (LoRA) parameters passed to optimizer
+    Full-Parameter COCONUT training for Qwen 3B.
+    Uses AdamW8bit to fit in 24GB VRAM, with aggressive gradient 
+    clipping and warmup to prevent Qwen RMSNorm instability.
     """
-    import bitsandbytes as bnb  # Lazy import to prevent segfault at module load time
+    import bitsandbytes as bnb
 
     collator = MyCollator(tokenizer, latent_id=latent_id)
     ds_phase1 = get_hf_dataset(data_phase1, tokenizer)
@@ -140,12 +136,11 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
     scheduler = None
     loss_history = []
 
-    print("Starting Multi-Stage COCONUT Training with Stable LoRA & Warmup...")
+    print("Starting FULL PARAMETER COCONUT Training (Qwen 3B)...")
     for epoch in range(config.num_epochs_total):
 
         current_stage, drop_remaining, requires_reset = get_stage_info(epoch)
 
-        # Build dataset and loader BEFORE optimizer reset (needed for scheduler step count)
         train_ds = get_cot_latent_dataset(
             current_stage, drop_remaining, ds_phase1, config, start_id, latent_id, end_id, shuffle=True
         )
@@ -155,14 +150,15 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
 
         if requires_reset or optimizer is None:
             print(f"\n[Epoch {epoch}] Stage shifted to {current_stage}. "
-                  f"Hard resetting AdamW Optimizer & Scheduler...")
-            # Only pass the safe LoRA parameters to the 8-bit optimizer
+                  f"Hard resetting AdamW8bit Optimizer & Scheduler...")
+            
+            # Pass ALL parameters to the 8-bit optimizer for full tuning
             optimizer = bnb.optim.AdamW8bit(
-                filter(lambda p: p.requires_grad, coconut_model.parameters()),
+                coconut_model.parameters(),
                 lr=config.lr, weight_decay=config.weight_decay
             )
 
-            # Learning Rate Scheduler to Warmup the math
+            # 10% Warmup to prevent gradient shock
             epochs_in_stage = 3 if current_stage < 4 else (config.num_epochs_total - 12)
             total_steps_in_stage = (len(train_loader) * epochs_in_stage) // config.gradient_accumulation_steps
             warmup_steps = max(10, int(total_steps_in_stage * 0.1))
@@ -187,12 +183,14 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 outputs = coconut_model(input_ids, attention_mask, labels)
-                loss = outputs.loss / config.gradient_accumulation_steps
+                # Keep loss in float32 for stable division
+                loss = outputs.loss.to(torch.float32) / config.gradient_accumulation_steps
 
             loss.backward()
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=1.0)
+                # TIGHT CLIPPING: 0.3 (Standard is 1.0, but Qwen needs strict bounds)
+                torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=0.3)
                 
                 optimizer.step()
                 scheduler.step()
@@ -205,11 +203,9 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
             total_loss += loss.item() * config.gradient_accumulation_steps if 'loss' in locals() else total_loss
             pbar.set_postfix({"loss": total_loss / (step + 1)})
 
-        # Track epoch-level average loss
         epoch_avg_loss = total_loss / max(len(train_loader), 1)
         loss_history.append(epoch_avg_loss)
 
-    # Save checkpoint
     checkpoint_path = os.path.join(config.save_path, "coconut_phase1.pt")
     torch.save(coconut_model.state_dict(), checkpoint_path)
     print(f"Phase 1 checkpoint saved to {checkpoint_path}")

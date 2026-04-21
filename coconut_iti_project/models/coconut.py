@@ -181,16 +181,13 @@ class Coconut(nn.Module):
 
 def initialize_model(config):
     """
-    Initialize Qwen 3B with LoRA for stable fine-tuning.
+    Initialize Qwen 3B for full-parameter fine-tuning.
     
-    Uses LoRA to freeze base weights and prevent gradient explosion from
-    8-bit optimizer rounding errors compounding across 3B parameters.
-    Initializes ALL custom tokens (latent, start, end) to prevent
-    initial hidden state corruption.
+    All 3B parameters are trainable. VRAM is managed by AdamW8bit
+    in the trainer. Initializes ALL custom tokens (latent, start, end)
+    to prevent initial hidden state corruption.
     """
-    from peft import LoraConfig, get_peft_model
-
-    print(f"Initializing {config.model_id} with Stable LoRA...")
+    print(f"Initializing {config.model_id} for Full-Parameter Training...")
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id, 
@@ -214,24 +211,13 @@ def initialize_model(config):
         input_embeds = model.get_input_embeddings()
         init_id = tokenizer.encode("The", add_special_tokens=False)[0] 
 
+        # Crucial: Prevent initial uninitialized garbage noise
         for new_token_id in [latent_id, start_id, end_id]:
             input_embeds.weight.data[new_token_id] = input_embeds.weight.data[init_id].clone()
             if hasattr(model, 'lm_head') and model.lm_head is not None:
                 model.lm_head.weight.data[new_token_id] = model.lm_head.weight.data[init_id].clone()
-
-    # ====================================================================
-    # SAFE LORA ARCHITECTURE: Protects the base weights from explosion
-    # ====================================================================
-    lora_config = LoraConfig(
-        r=32, 
-        lora_alpha=64,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-    # ====================================================================
+                
+        input_embeds.weight.requires_grad = True
 
     coconut_model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id).to(config.device)
 
