@@ -1,4 +1,5 @@
 import os
+import sys
 
 # --- Must be set BEFORE any library imports to prevent TF/PyTorch CUDA conflict ---
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"           # Suppress TF logging entirely
@@ -12,13 +13,33 @@ import time
 import torch
 
 from configs.config import Config, set_seed
-from core.evaluator import analyze_confidence, evaluate_with_iti, print_sample_outputs
+from core.evaluator import run_full_evaluation, print_sample_outputs
 from core.extractor import extract_truth_vector
 from core.trainer import train_phase1
 from data.data_loader import prepare_datasets
 from models.coconut import initialize_model
 from utils.helpers import clear_memory, save_phase_log
 from utils.visualizer import plot_latent_pca, plot_loss_curve
+
+
+class TeeLogger:
+    """Writes all stdout to both the terminal and a log file simultaneously."""
+    def __init__(self, filepath):
+        self.terminal = sys.stdout
+        self.log = open(filepath, "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
+        sys.stdout = self.terminal
 
 
 def log_phase(phase_num, phase_name):
@@ -28,7 +49,7 @@ def log_phase(phase_num, phase_name):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="COCONUT ITI Pipeline")
+    parser = argparse.ArgumentParser(description="COCONUT ITI Pipeline (Qwen 3B Full-Parameter)")
     parser.add_argument(
         "--skip-phase1", action="store_true",
         help="Skip Phase 1 training and load checkpoint from checkpoints/coconut_phase1.pt",
@@ -39,29 +60,34 @@ def main():
     )
     args = parser.parse_args()
 
-    pipeline_start = time.time()
-
-    print("=" * 60)
-    print("  COCONUT + ITI Steering Pipeline")
-    print("=" * 60)
-
     config = Config()
     set_seed(config.seed)
     os.makedirs(config.save_path, exist_ok=True)
+
+    # --- Pipeline-level log: capture ALL stdout to a master log file ---
+    master_log_path = os.path.join(config.save_path, "pipeline_full.log")
+    tee = TeeLogger(master_log_path)
+    sys.stdout = tee
+
+    pipeline_start = time.time()
+
+    print("=" * 60)
+    print("  COCONUT + ITI Steering Pipeline (Qwen 3B Full-Parameter)")
+    print("=" * 60)
 
     print(f"\nDevice: {config.device}")
     print(f"Model: {config.model_id}")
     print(f"BF16: {config.bf16}")
     print(f"Batch size: {config.batch_size_training} x {config.gradient_accumulation_steps} "
           f"= {config.batch_size_training * config.gradient_accumulation_steps} effective")
-    print(f"Epochs: {config.num_epochs_phase1}")
+    print(f"Epochs: {config.num_epochs_total}")
     print(f"Alpha sweep: {config.alpha_sweep}")
 
     # --- Data ---
     print("\n" + "-" * 60)
     print("  Loading Datasets")
     print("-" * 60)
-    data_phase1, data_phase2, data_phase3, test_data = prepare_datasets(config)
+    data_phase1, data_phase2, test_data = prepare_datasets(config)
 
     # --- Model ---
     print("\n" + "-" * 60)
@@ -72,7 +98,7 @@ def main():
     # =========================================================
     # Phase 1: Silent Thinking (Base Training)
     # =========================================================
-    log_phase(1, "SILENT THINKING (Base COCONUT Training)")
+    log_phase(1, "SILENT THINKING (Full-Parameter COCONUT Training)")
 
     if not args.skip_phase1:
         phase1_start = time.time()
@@ -86,9 +112,10 @@ def main():
         plot_loss_curve(loss_history, os.path.join(config.save_path, "loss_curve.png"))
         print_sample_outputs(coconut_model, tokenizer, test_data, config, phase_name="PHASE 1 (BASE)")
 
-        save_phase_log(config.save_path, 1, "SILENT THINKING (Base COCONUT Training)", (
+        save_phase_log(config.save_path, 1, "SILENT THINKING (Full-Parameter COCONUT Training)", (
             f"Model: {config.model_id}\n"
-            f"Epochs: {config.num_epochs_phase1}\n"
+            f"Training Mode: Full-Parameter (no LoRA)\n"
+            f"Epochs: {config.num_epochs_total}\n"
             f"Learning Rate: {config.lr}\n"
             f"Batch Size: {config.batch_size_training} x {config.gradient_accumulation_steps} "
             f"= {config.batch_size_training * config.gradient_accumulation_steps} effective\n"
@@ -106,7 +133,7 @@ def main():
         coconut_model.load_state_dict(torch.load(checkpoint_path, map_location=config.device))
         print("[SKIP] Checkpoint loaded successfully.")
 
-        save_phase_log(config.save_path, 1, "SILENT THINKING (Base COCONUT Training)", (
+        save_phase_log(config.save_path, 1, "SILENT THINKING (Full-Parameter COCONUT Training)", (
             f"SKIPPED: Loaded from checkpoint\n"
             f"Checkpoint: {checkpoint_path}\n"
         ))
@@ -168,29 +195,29 @@ def main():
     ))
 
     # =========================================================
-    # Phase 4: Final Exam (Evaluation with ITI)
+    # Phase 4: Final Exam (Full Evaluation)
     # =========================================================
-    log_phase(4, "FINAL EXAM (Inference-Time Intervention Evaluation)")
+    log_phase(4, "FINAL EXAM (Full Pipeline Evaluation)")
 
     phase4_start = time.time()
-    experiment_results = evaluate_with_iti(
+    experiment_results, ablation_results = run_full_evaluation(
         coconut_model, test_data, tokenizer, config, truth_vector, latent_id
     )
     phase4_time = time.time() - phase4_start
-    print(f"\nPhase 4 evaluation completed in {phase4_time / 60:.1f} minutes")
+    print(f"\nPhase 4 completed in {phase4_time / 60:.1f} minutes")
 
-    # --- Confidence Deep Dive ---
-    print("\n" + "-" * 60)
-    print("  Confidence Deep Dive (Logit Analysis)")
-    print("-" * 60)
-    analyze_confidence(coconut_model, test_data, tokenizer, config, truth_vector, latent_id)
-
-    # Build Phase 4 log content from experiment results
+    # Build Phase 4 log content
     phase4_lines = [
         f"Test Samples: {len(test_data)}\n",
         f"Alpha Sweep: {config.alpha_sweep}\n",
         f"Alpha Decay (gamma): {config.alpha_decay}\n",
         f"Duration: {phase4_time / 60:.1f} minutes\n\n",
+        "--- STRUCTURAL ABLATIONS ---\n",
+        f"No CoT:              Accuracy {ablation_results['no_cot'][0]:.2%} | Avg Tokens: {ablation_results['no_cot'][1]:.1f}\n",
+        f"Text-based CoT:      Accuracy {ablation_results['text_cot'][0]:.2%} | Avg Tokens: {ablation_results['text_cot'][1]:.1f}\n",
+        f"Just CCoT:           Accuracy {ablation_results['ccot'][0]:.2%} | Avg Tokens: {ablation_results['ccot'][1]:.1f}\n",
+        f"Random Noise:        Accuracy {ablation_results['random'][0]:.2%} | Avg Tokens: {ablation_results['random'][1]:.1f}\n\n",
+        "--- ITI SWEEP ---\n",
         f"{'Alpha':<8} | {'Accuracy':<10} | {'Flip Rate':<10} | {'Faithfulness'}\n",
         "-" * 50 + "\n",
     ]
@@ -199,7 +226,7 @@ def main():
             f"{res['alpha']:<8} | {res['accuracy']:.2%}     | "
             f"{res['flip_rate']:.2%}     | {res['trajectory_faithfulness']:.4f}\n"
         )
-    save_phase_log(config.save_path, 4, "FINAL EXAM (Inference-Time Intervention Evaluation)",
+    save_phase_log(config.save_path, 4, "FINAL EXAM (Full Pipeline Evaluation)",
                    "".join(phase4_lines))
 
     # --- Summary ---
@@ -211,20 +238,28 @@ def main():
     print(f"Checkpoints saved to: {os.path.abspath(config.save_path)}")
     print(f"Loss curve: {os.path.join(config.save_path, 'loss_curve.png')}")
     print(f"PCA plot: {os.path.join(config.save_path, 'pca_latents.html')}")
+    print(f"Master log: {master_log_path}")
+    print(f"Evaluation log: {os.path.join(config.save_path, 'phase4_evaluation.log')}")
 
     # Pipeline summary log
     save_phase_log(config.save_path, 0, "PIPELINE SUMMARY", (
         f"Model: {config.model_id}\n"
+        f"Training Mode: Full-Parameter (no LoRA)\n"
         f"Device: {config.device}\n"
         f"BF16: {config.bf16}\n"
         f"Total Runtime: {total_time / 60:.1f} minutes\n"
         f"Checkpoints Directory: {os.path.abspath(config.save_path)}\n\n"
         f"Log Files:\n"
+        f"  - {os.path.join(config.save_path, 'pipeline_full.log')} (master)\n"
+        f"  - {os.path.join(config.save_path, 'phase4_evaluation.log')}\n"
         f"  - {os.path.join(config.save_path, 'phase1_log.txt')}\n"
         f"  - {os.path.join(config.save_path, 'phase2_log.txt')}\n"
         f"  - {os.path.join(config.save_path, 'phase3_log.txt')}\n"
         f"  - {os.path.join(config.save_path, 'phase4_log.txt')}\n"
     ))
+
+    # Restore stdout and close log
+    tee.close()
 
 
 if __name__ == "__main__":

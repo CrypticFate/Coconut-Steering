@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from transformers import PreTrainedTokenizerBase
+from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from tqdm.auto import tqdm
 
 from data.data_loader import get_hf_dataset
@@ -12,68 +14,70 @@ from utils.helpers import clear_memory
 
 
 def get_stage_info(epoch):
-    # Finer-grained curriculum for 24 epochs
-    # Each stage drops 4 more tokens and adds 1 more latent token
-    # Stages 0-6: progressive token dropping (3 epochs each = 21 epochs)
-    # Epochs 21-23: drop_remaining = True (full latent mode)
-    if epoch < 3:
+    """
+    5-stage COCONUT curriculum for 50 epochs:
+    - Epochs  0-5:  Stage 0 (full CoT, no latent drops)
+    - Epochs  6-8:  Stage 1 (drop 1 step, replace with latents)
+    - Epochs  9-11: Stage 2 (drop 2 steps)
+    - Epochs 12-14: Stage 3 (drop 3 steps)
+    - Epochs 15-49: Stage 4 (drop ALL remaining text, full latent mode)
+    """
+    if epoch < 6:
         return 0, False, (epoch == 0)
-    elif epoch < 6:
-        return 1, False, (epoch == 3)
     elif epoch < 9:
-        return 2, False, (epoch == 6)
+        return 1, False, (epoch == 6)
     elif epoch < 12:
-        return 3, False, (epoch == 9)
+        return 2, False, (epoch == 9)
     elif epoch < 15:
-        return 4, False, (epoch == 12)
-    elif epoch < 18:
-        return 5, False, (epoch == 15)
-    elif epoch < 21:
-        return 6, False, (epoch == 18)
+        return 3, False, (epoch == 12)
     else:
-        return 6, True, (epoch == 21)
+        return 4, True, (epoch == 15)
 
 
 def get_cot_latent_dataset(scheduled_stage, drop_remaining, base_dataset, configs,
                            start_id, latent_id, end_id, shuffle=False):
+    """
+    Build the COCONUT curriculum dataset for a given stage.
+    
+    In hybrid mode, the first reasoning step is always kept as the
+    'reasoning skeleton'. Remaining steps are progressively replaced
+    with latent tokens across stages.
+    """
     def process_dataset(sample):
         # --- HYBRID ARCHITECTURE ---
-        # We extract Step 1 and force it to remain in English as the "Reasoning Skeleton"
+        # Extract Step 1 as the "Reasoning Skeleton" (always kept in English)
         if len(sample["steps_tokenized"]) > 0 and configs.hybrid_mode:
             skeleton_text = sample["steps_tokenized"][0]
-            remaining_steps = list(itertools.chain.from_iterable(sample["steps_tokenized"][1:]))
+            remaining_steps = sample["steps_tokenized"][1:]
         else:
             skeleton_text = []
-            remaining_steps = list(itertools.chain.from_iterable(sample["steps_tokenized"]))
+            remaining_steps = sample["steps_tokenized"]
 
-        # --- FINER-GRAINED CURRICULUM ---
-        # Instead of dropping whole sentences, we drop a few tokens at a time
-        tokens_to_drop = min(scheduled_stage * configs.drop_tokens_per_stage, len(remaining_steps))
-
+        # Drop whole steps according to the current curriculum stage
+        steps_to_drop = min(scheduled_stage, len(remaining_steps))
+        
         if drop_remaining:
-            kept_remaining_text = []
+            kept_remaining_steps = []
+            n_latent_tokens = configs.max_latent_tokens
         else:
-            kept_remaining_text = remaining_steps[tokens_to_drop:]
+            kept_remaining_steps = remaining_steps[steps_to_drop:]
+            n_latent_tokens = steps_to_drop * configs.c_thought
+            
+        kept_remaining_text = list(itertools.chain.from_iterable(kept_remaining_steps))
 
-        n_latent_tokens = min(scheduled_stage * configs.c_thought, configs.max_latent_tokens)
-
-        # Build the final hybrid sequence: [Question] -> [Skeleton Text] -> <bot> [Latents] <eot> -> [Remaining Text]
-        tokens = (sample["question_tokenized"] +
-                  skeleton_text +
+        # Build: [Question] -> [Skeleton] -> <bot> [Latents] <eot> -> [Remaining] -> [Answer]
+        tokens = (sample["question_tokenized"] + skeleton_text + 
                   [start_id] + [latent_id] * n_latent_tokens + [end_id] +
-                  kept_remaining_text +
-                  sample["answer_tokenized"])
-
-        # Mask the loss for the Question, the Skeleton, and the Latents.
-        # The model only learns to predict the text coming AFTER the silent thoughts.
+                  kept_remaining_text + sample["answer_tokenized"])
+        
+        # Mask: loss only on text AFTER the latent section
         mask_len = len(sample["question_tokenized"]) + len(skeleton_text) + n_latent_tokens + 2
         labels = [-100] * mask_len + tokens[mask_len:]
-
+        
         tokens = tokens[:configs.max_seq_len]
         labels = labels[:configs.max_seq_len]
-
         return {"input_ids": tokens, "labels": labels, "attention_mask": [1] * len(tokens)}
-
+    
     dataset = base_dataset.map(process_dataset, remove_columns=list(base_dataset.features))
     if shuffle:
         dataset = dataset.shuffle(seed=configs.seed)
@@ -82,7 +86,11 @@ def get_cot_latent_dataset(scheduled_stage, drop_remaining, base_dataset, config
 
 @dataclass
 class MyCollator:
-    tokenizer: object
+    """
+    Custom data collator that aligns latent token positions across
+    batch elements by left-padding shorter sequences.
+    """
+    tokenizer: PreTrainedTokenizerBase
     latent_id: int
     label_pad_token_id: int = -100
 
@@ -104,31 +112,22 @@ class MyCollator:
                 feature["attention_mask"] = [0] * pad + feature["attention_mask"]
                 if "labels" in feature:
                     feature["labels"] = [self.label_pad_token_id] * pad + feature["labels"]
-
+        
         labels = [f.pop("labels") for f in features] if "labels" in features[0] else None
-
-        # Manual padding (replaces pad_without_fast_tokenizer_warning)
-        max_len = max(len(f["input_ids"]) for f in features)
-        padded_input_ids = []
-        padded_attention_mask = []
-        for f in features:
-            pad_len = max_len - len(f["input_ids"])
-            padded_input_ids.append(f["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
-            padded_attention_mask.append(f["attention_mask"] + [0] * pad_len)
-
-        batch = {
-            "input_ids": torch.tensor(padded_input_ids),
-            "attention_mask": torch.tensor(padded_attention_mask),
-        }
-
+        batch = pad_without_fast_tokenizer_warning(self.tokenizer, features, padding=True, return_tensors="pt")
         if labels:
-            batch["labels"] = torch.tensor(
-                [l + [self.label_pad_token_id] * (max_len - len(l)) for l in labels]
-            )
+             max_len = batch["input_ids"].shape[1]
+             batch["labels"] = torch.tensor([l + [self.label_pad_token_id]*(max_len-len(l)) for l in labels])
         return batch
 
 
 def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id):
+    """
+    Full-parameter multi-stage COCONUT training.
+    
+    Uses AdamW8bit (not PagedAdamW8bit) for full-parameter optimization,
+    with torch.amp.autocast for bfloat16 mixed precision.
+    """
     import bitsandbytes as bnb  # Lazy import to prevent segfault at module load time
 
     collator = MyCollator(tokenizer, latent_id=latent_id)
@@ -137,15 +136,16 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
     optimizer = None
     loss_history = []
 
-    print("Starting Phase 1 Base COCONUT Training...")
-    for epoch in range(config.num_epochs_phase1):
+    print("Starting FULL PARAMETER Multi-Stage COCONUT Training...")
+    for epoch in range(config.num_epochs_total):
 
         current_stage, drop_remaining, requires_reset = get_stage_info(epoch)
 
         if requires_reset or optimizer is None:
             print(f"\n[Epoch {epoch}] Stage shifted to {current_stage}. "
-                  f"Hard resetting PagedAdamW8bit Optimizer...")
-            optimizer = bnb.optim.PagedAdamW8bit(
+                  f"Hard resetting AdamW Optimizer...")
+            # Full-parameter optimizer: ALL parameters, not just LoRA adapters
+            optimizer = bnb.optim.AdamW8bit(
                 coconut_model.parameters(), lr=config.lr, weight_decay=config.weight_decay
             )
             torch.cuda.empty_cache()
@@ -161,8 +161,7 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
         total_loss = 0
         pbar = tqdm(
             train_loader,
-            desc=f"Epoch {epoch + 1}/{config.num_epochs_phase1} | "
-                 f"Stage {current_stage} | Drop Text: {drop_remaining}",
+            desc=f"Epoch {epoch + 1}/{config.num_epochs_total} | Stage {current_stage}",
         )
 
         for step, batch in enumerate(pbar):
@@ -170,21 +169,28 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
             attention_mask = batch["attention_mask"].to(config.device)
             labels = batch["labels"].to(config.device)
 
-            outputs = coconut_model(input_ids, attention_mask, labels)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                outputs = coconut_model(input_ids, attention_mask, labels)
+                loss = outputs.loss / config.gradient_accumulation_steps
 
-            loss_history.append(outputs.loss.item())
-
-            loss = outputs.loss / config.gradient_accumulation_steps
             loss.backward()
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 optimizer.zero_grad()
+                
+                del outputs
+                del loss
                 torch.cuda.empty_cache()
 
-            total_loss += loss.item() * config.gradient_accumulation_steps
+            total_loss += loss.item() * config.gradient_accumulation_steps if 'loss' in locals() else total_loss
             pbar.set_postfix({"loss": total_loss / (step + 1)})
+
+        # Track epoch-level average loss
+        epoch_avg_loss = total_loss / max(len(train_loader), 1)
+        loss_history.append(epoch_avg_loss)
 
     # Save checkpoint
     checkpoint_path = os.path.join(config.save_path, "coconut_phase1.pt")
