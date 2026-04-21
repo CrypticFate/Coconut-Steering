@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from tqdm.auto import tqdm
 
@@ -125,8 +125,10 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
     """
     Full-parameter multi-stage COCONUT training.
     
-    Uses AdamW8bit (not PagedAdamW8bit) for full-parameter optimization,
-    with torch.amp.autocast for bfloat16 mixed precision.
+    Uses AdamW8bit for full-parameter optimization with:
+    - 10% linear warmup scheduler per stage to prevent initial overshooting
+    - Tight gradient clipping (max_norm=0.3) to prevent optimizer derailment
+    - torch.amp.autocast for bfloat16 mixed precision
     """
     import bitsandbytes as bnb  # Lazy import to prevent segfault at module load time
 
@@ -134,6 +136,7 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
     ds_phase1 = get_hf_dataset(data_phase1, tokenizer)
 
     optimizer = None
+    scheduler = None
     loss_history = []
 
     print("Starting FULL PARAMETER Multi-Stage COCONUT Training...")
@@ -141,21 +144,32 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
 
         current_stage, drop_remaining, requires_reset = get_stage_info(epoch)
 
-        if requires_reset or optimizer is None:
-            print(f"\n[Epoch {epoch}] Stage shifted to {current_stage}. "
-                  f"Hard resetting AdamW Optimizer...")
-            # Full-parameter optimizer: ALL parameters, not just LoRA adapters
-            optimizer = bnb.optim.AdamW8bit(
-                coconut_model.parameters(), lr=config.lr, weight_decay=config.weight_decay
-            )
-            torch.cuda.empty_cache()
-
+        # Build dataset and loader BEFORE optimizer reset (needed for scheduler step count)
         train_ds = get_cot_latent_dataset(
             current_stage, drop_remaining, ds_phase1, config, start_id, latent_id, end_id, shuffle=True
         )
         train_loader = DataLoader(
             train_ds, batch_size=config.batch_size_training, collate_fn=collator, shuffle=True
         )
+
+        if requires_reset or optimizer is None:
+            print(f"\n[Epoch {epoch}] Stage shifted to {current_stage}. "
+                  f"Hard resetting AdamW Optimizer & Scheduler...")
+            # Full-parameter optimizer: ALL parameters, not just LoRA adapters
+            optimizer = bnb.optim.AdamW8bit(
+                coconut_model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+            )
+
+            # Calculate warmup steps for this stage
+            epochs_in_stage = 3 if current_stage < 4 else (config.num_epochs_total - 15)
+            total_steps_in_stage = (len(train_loader) * epochs_in_stage) // config.gradient_accumulation_steps
+            warmup_steps = max(10, int(total_steps_in_stage * 0.1))
+
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps_in_stage
+            )
+            print(f"  Scheduler: {warmup_steps} warmup / {total_steps_in_stage} total optimizer steps")
+            torch.cuda.empty_cache()
 
         coconut_model.train()
         total_loss = 0
@@ -176,9 +190,11 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
             loss.backward()
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
-                nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=1.0)
+                # Tighter gradient clipping to prevent optimizer derailment
+                nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=0.3)
                 
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
                 
                 del outputs

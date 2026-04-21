@@ -6,7 +6,7 @@ import os
 class Config:
     def __init__(self):
         # --- THE 24GB VRAM ENGINE ---
-        self.model_id = "Qwen/Qwen2.5-3B" 
+        self.model_id = "./qwen-3b-local" 
         self.save_path = "./checkpoints_coconut_qwen3b_full"
         
         # Keep physical batch at 1 to prevent OOM during full-parameter backprop
@@ -14,7 +14,8 @@ class Config:
         self.gradient_accumulation_steps = 128
         self.max_seq_len = 512             
         
-        self.lr = 2e-5  # Slightly lower learning rate for full-parameter tuning
+        # Lower LR for full-parameter tuning stability
+        self.lr = 5e-6
         self.weight_decay = 0.01
         
         # --- COCONUT CURRICULUM ---

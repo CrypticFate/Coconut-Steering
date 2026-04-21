@@ -205,15 +205,15 @@ def initialize_model(config):
     )
     model.resize_token_embeddings(len(tokenizer))
 
-    # Initialize Latent Weights by cloning the embedding for "The"
+    # Initialize ALL custom tokens to prevent initial hidden state corruption
     with torch.no_grad():
         input_embeds = model.get_input_embeddings()
         init_id = tokenizer.encode("The", add_special_tokens=False)[0] 
 
-        input_embeds.weight.data[latent_id] = input_embeds.weight.data[init_id].clone()
-
-        if hasattr(model, 'lm_head') and model.lm_head is not None:
-            model.lm_head.weight.data[latent_id] = model.lm_head.weight.data[init_id].clone()
+        for new_token_id in [latent_id, start_id, end_id]:
+            input_embeds.weight.data[new_token_id] = input_embeds.weight.data[init_id].clone()
+            if hasattr(model, 'lm_head') and model.lm_head is not None:
+                model.lm_head.weight.data[new_token_id] = model.lm_head.weight.data[init_id].clone()
 
         input_embeds.weight.requires_grad = True
 
