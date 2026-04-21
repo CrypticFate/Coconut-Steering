@@ -216,8 +216,16 @@ def initialize_model(config):
             input_embeds.weight.data[new_token_id] = input_embeds.weight.data[init_id].clone()
             if hasattr(model, 'lm_head') and model.lm_head is not None:
                 model.lm_head.weight.data[new_token_id] = model.lm_head.weight.data[init_id].clone()
+                model.lm_head.weight.data[new_token_id] = model.lm_head.weight.data[init_id].clone()
                 
         input_embeds.weight.requires_grad = True
+
+    # UPCAST SENSITIVE LAYERS TO FP32
+    # Qwen's RMSNorm, embeddings, and lm_head MUST be FP32 to prevent 
+    # AdamW8bit precision loss and catastrophic gradient explosion.
+    for name, param in model.named_parameters():
+        if "norm" in name or "embed" in name or "lm_head" in name:
+            param.data = param.data.to(torch.float32)
 
     coconut_model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id).to(config.device)
 

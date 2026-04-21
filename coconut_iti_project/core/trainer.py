@@ -153,9 +153,10 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
                   f"Hard resetting AdamW8bit Optimizer & Scheduler...")
             
             # Pass ALL parameters to the 8-bit optimizer for full tuning
+            # EPS=1e-5 is CRITICAL for bfloat16 to prevent division-by-zero in AdamW variance
             optimizer = bnb.optim.AdamW8bit(
                 coconut_model.parameters(),
-                lr=config.lr, weight_decay=config.weight_decay
+                lr=config.lr, weight_decay=config.weight_decay, eps=1e-5
             )
 
             # 10% Warmup to prevent gradient shock
@@ -190,11 +191,15 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 # TIGHT CLIPPING: 0.3 (Standard is 1.0, but Qwen needs strict bounds)
-                torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=0.3)
+                grad_norm = torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=0.3)
                 
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"\n[Warning] Grad norm is {grad_norm.item()} at step {step}. Skipping update to save VRAM weights.")
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
                 
                 del outputs
                 del loss
