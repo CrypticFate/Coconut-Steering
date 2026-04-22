@@ -49,7 +49,7 @@ def log_phase(phase_num, phase_name):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="COCONUT ITI Pipeline (Qwen 3B Full Parameter)")
+    parser = argparse.ArgumentParser(description="COCONUT ITI Pipeline (Qwen 1.5B Math Full Parameter)")
     parser.add_argument(
         "--skip-phase1", action="store_true",
         help="Skip Phase 1 training and load checkpoint from checkpoints/coconut_phase1.pt",
@@ -72,7 +72,7 @@ def main():
     pipeline_start = time.time()
 
     print("=" * 60)
-    print("  COCONUT + ITI Steering Pipeline (Qwen 3B Full Parameter)")
+    print("  COCONUT + ITI Steering Pipeline (Qwen 1.5B Math Full Parameter)")
     print("=" * 60)
 
     print(f"\nDevice: {config.device}")
@@ -114,7 +114,7 @@ def main():
 
         save_phase_log(config.save_path, 1, "SILENT THINKING (Full Parameter COCONUT Training)", (
             f"Model: {config.model_id}\n"
-            f"Training Mode: Full Parameter (AdamW8bit)\n"
+            f"Training Mode: Full Parameter (Native 32-bit AdamW)\n"
             f"Epochs: {config.num_epochs_total}\n"
             f"Learning Rate: {config.lr}\n"
             f"Batch Size: {config.batch_size_training} x {config.gradient_accumulation_steps} "
@@ -244,7 +244,7 @@ def main():
     # Pipeline summary log
     save_phase_log(config.save_path, 0, "PIPELINE SUMMARY", (
         f"Model: {config.model_id}\n"
-        f"Training Mode: Full Parameter (AdamW8bit)\n"
+        f"Training Mode: Full Parameter (Native 32-bit AdamW)\n"
         f"Device: {config.device}\n"
         f"BF16: {config.bf16}\n"
         f"Total Runtime: {total_time / 60:.1f} minutes\n"

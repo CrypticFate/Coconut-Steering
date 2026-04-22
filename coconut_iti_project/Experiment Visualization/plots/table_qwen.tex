@@ -1,0 +1,32 @@
+\documentclass[preview, border=5mm]{standalone}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{caption}
+
+\begin{document}
+\begin{minipage}{14cm}
+    \centering
+    \captionof{table}{Intervention Effects on Qwen Models at Varying Strengths ($\alpha$)}
+    \vspace{0.2cm}
+    \begin{tabular}{l c c c c}
+        \toprule
+        \textbf{Model} & \textbf{$\alpha$} & \textbf{Accuracy} & \textbf{Flip Rate} & \textbf{Faithfulness} \\
+        \midrule
+        \multirow{5}{*}{Qwen2.5-0.5B-Instruct} 
+        & 0.0 & 14.50\% & 0.00\% & 0.0000 \\
+        & 5.0 & 14.50\% & 0.00\% & 0.2290 \\
+        & 10.0 & 15.00\% & 0.58\% & 0.3665 \\
+        & 20.0 & 15.00\% & 0.58\% & 0.5907 \\
+        & 50.0 & 15.50\% & 1.75\% & 0.8772 \\
+        \midrule
+        \multirow{5}{*}{Qwen2.5-3B-Instruct} 
+        & 0.0 & 12.51\% & 0.00\% & 0.0000 \\
+        & 5.0 & 12.51\% & 0.00\% & -0.1517 \\
+        & 10.0 & 12.51\% & 0.00\% & -0.0904 \\
+        & 20.0 & 12.43\% & 0.00\% & 0.0502 \\
+        & 50.0 & 12.59\% & 1.39\% & 0.4850 \\
+        \bottomrule
+    \end{tabular}
+\end{minipage}
+\end{document}

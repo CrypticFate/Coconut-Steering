@@ -1,0 +1,32 @@
+\documentclass[preview, border=5mm]{standalone}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{caption}
+
+\begin{document}
+\begin{minipage}{14cm}
+    \centering
+    \captionof{table}{Intervention Effects on Llama and Phi-2 Models at Varying Strengths ($\alpha$)}
+    \vspace{0.2cm}
+    \begin{tabular}{l c c c c}
+        \toprule
+        \textbf{Model} & \textbf{$\alpha$} & \textbf{Accuracy} & \textbf{Flip Rate} & \textbf{Faithfulness} \\
+        \midrule
+        \multirow{5}{*}{Llama-3.2-3B} 
+        & 0.0 & 9.86\% & 0.00\% & 0.0000 \\
+        & 5.0 & 9.55\% & 1.01\% & 0.1882 \\
+        & 10.0 & 9.78\% & 2.02\% & 0.3537 \\
+        & 20.0 & 10.77\% & 4.29\% & 0.5975 \\
+        & 50.0 & 10.69\% & 4.54\% & 0.8730 \\
+        \midrule
+        \multirow{5}{*}{microsoft/phi-2} 
+        & 0.0 & 14.78\% & 0.00\% & 0.0000 \\
+        & 5.0 & 14.94\% & 2.22\% & 0.1436 \\
+        & 10.0 & 15.62\% & 3.65\% & 0.2448 \\
+        & 20.0 & 15.54\% & 5.25\% & 0.4304 \\
+        & 50.0 & 13.87\% & 8.72\% & 0.7800 \\
+        \bottomrule
+    \end{tabular}
+\end{minipage}
+\end{document}

@@ -5,16 +5,16 @@ import os
 
 class Config:
     def __init__(self):
-        # Pointing to your local offline model folder
-        self.model_id = "./qwen-3b-local" 
-        self.save_path = "./checkpoints_coconut_qwen3b_full"
+        # 1. Point to the new 1.5B Math model
+        self.model_id = "./qwen-1.5b-math-local" 
+        self.save_path = "./checkpoints_coconut_qwen1.5b_math_full"
         
         self.batch_size_training = 1       
         self.gradient_accumulation_steps = 128
         self.max_seq_len = 512             
         
-        # CRITICAL: The Golden LR for Full-Parameter Qwen
-        self.lr = 5e-6  
+        # 2. Golden LR for 1.5B Full-Parameter Tune
+        self.lr = 1e-5  
         self.weight_decay = 0.01
         
         self.hybrid_mode = True           

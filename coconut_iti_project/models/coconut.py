@@ -181,13 +181,13 @@ class Coconut(nn.Module):
 
 def initialize_model(config):
     """
-    Initialize Qwen 3B for full-parameter fine-tuning.
+    Initialize Qwen2.5-Math-1.5B for full-parameter fine-tuning.
     
-    All 3B parameters are trainable. VRAM is managed by AdamW8bit
-    in the trainer. Initializes ALL custom tokens (latent, start, end)
-    to prevent initial hidden state corruption.
+    All 1.5B parameters are trainable. The smaller model fits easily 
+    in 24GB VRAM with a native 32-bit AdamW optimizer, eliminating the 
+    need for 8-bit quantization or FP32 upcasting hacks.
     """
-    print(f"Initializing {config.model_id} for Full-Parameter Training...")
+    print(f"Initializing {config.model_id} for Full-Parameter Tuning...")
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id, 
@@ -198,6 +198,7 @@ def initialize_model(config):
     tokenizer = AutoTokenizer.from_pretrained(config.model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.eos_token_id
 
     # Inject Latent Vocabulary
     tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>", "<|latent|>"])
@@ -211,21 +212,13 @@ def initialize_model(config):
         input_embeds = model.get_input_embeddings()
         init_id = tokenizer.encode("The", add_special_tokens=False)[0] 
 
-        # Crucial: Prevent initial uninitialized garbage noise
         for new_token_id in [latent_id, start_id, end_id]:
             input_embeds.weight.data[new_token_id] = input_embeds.weight.data[init_id].clone()
             if hasattr(model, 'lm_head') and model.lm_head is not None:
                 model.lm_head.weight.data[new_token_id] = model.lm_head.weight.data[init_id].clone()
-                model.lm_head.weight.data[new_token_id] = model.lm_head.weight.data[init_id].clone()
                 
+        # CRITICAL: Expose embeddings to the optimizer
         input_embeds.weight.requires_grad = True
-
-    # UPCAST SENSITIVE LAYERS TO FP32
-    # Qwen's RMSNorm, embeddings, and lm_head MUST be FP32 to prevent 
-    # AdamW8bit precision loss and catastrophic gradient explosion.
-    for name, param in model.named_parameters():
-        if "norm" in name or "embed" in name or "lm_head" in name:
-            param.data = param.data.to(torch.float32)
 
     coconut_model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id).to(config.device)
 

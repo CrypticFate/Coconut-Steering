@@ -123,11 +123,10 @@ class MyCollator:
 
 def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id):
     """
-    Full-Parameter COCONUT training for Qwen 3B.
-    Uses AdamW8bit to fit in 24GB VRAM, with aggressive gradient 
-    clipping and warmup to prevent Qwen RMSNorm instability.
+    Full-Parameter COCONUT training for Qwen2.5-Math-1.5B.
+    Utilizes pure 32-bit torch.optim.AdamW for maximum stability, 
+    easily fitting within 24GB VRAM.
     """
-    import bitsandbytes as bnb
 
     collator = MyCollator(tokenizer, latent_id=latent_id)
     ds_phase1 = get_hf_dataset(data_phase1, tokenizer)
@@ -136,7 +135,7 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
     scheduler = None
     loss_history = []
 
-    print("Starting FULL PARAMETER COCONUT Training (Qwen 3B)...")
+    print("Starting FULL PARAMETER COCONUT Training (Qwen 1.5B Math)...")
     for epoch in range(config.num_epochs_total):
 
         current_stage, drop_remaining, requires_reset = get_stage_info(epoch)
@@ -150,16 +149,14 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
 
         if requires_reset or optimizer is None:
             print(f"\n[Epoch {epoch}] Stage shifted to {current_stage}. "
-                  f"Hard resetting AdamW8bit Optimizer & Scheduler...")
+                  f"Hard resetting Native 32-bit AdamW Optimizer & Scheduler...")
             
-            # Pass ALL parameters to the 8-bit optimizer for full tuning
-            # EPS=1e-5 is CRITICAL for bfloat16 to prevent division-by-zero in AdamW variance
-            optimizer = bnb.optim.AdamW8bit(
+            # 1. Native 32-bit Optimizer (No Quantization Noise!)
+            optimizer = torch.optim.AdamW(
                 coconut_model.parameters(),
-                lr=config.lr, weight_decay=config.weight_decay, eps=1e-5
+                lr=config.lr, weight_decay=config.weight_decay, eps=1e-8
             )
 
-            # 10% Warmup to prevent gradient shock
             epochs_in_stage = 3 if current_stage < 4 else (config.num_epochs_total - 12)
             total_steps_in_stage = (len(train_loader) * epochs_in_stage) // config.gradient_accumulation_steps
             warmup_steps = max(10, int(total_steps_in_stage * 0.1))
@@ -184,22 +181,18 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 outputs = coconut_model(input_ids, attention_mask, labels)
-                # Keep loss in float32 for stable division
+                # Keep loss in float32 for stable accumulation
                 loss = outputs.loss.to(torch.float32) / config.gradient_accumulation_steps
 
             loss.backward()
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
-                # TIGHT CLIPPING: 0.3 (Standard is 1.0, but Qwen needs strict bounds)
-                grad_norm = torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=0.3)
+                # 2. Relaxed Clipping (1.0) since we are in stable 32-bit precision
+                torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=1.0)
                 
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"\n[Warning] Grad norm is {grad_norm.item()} at step {step}. Skipping update to save VRAM weights.")
-                    optimizer.zero_grad()
-                else:
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
                 
                 del outputs
                 del loss
