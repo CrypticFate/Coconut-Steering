@@ -12,6 +12,7 @@ build/
 venv/
 env/
 .venv/
+Experiment Visualization/venv/
 
 # Jupyter Notebook
 .ipynb_checkpoints/
