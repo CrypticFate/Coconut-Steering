@@ -31,6 +31,34 @@ def _build_teacher_forced_batch(sample, tokenizer, config):
     return input_ids, attention_mask, labels
 
 
+def _tokenize_for_alpha_tuning(sample, tokenizer, device):
+    """Question through ``<|start-latent|>`` only; answer ids separate (matches steered layout)."""
+    q_text = sample["question"] + "\n<|start-latent|>"
+    question_ids = tokenizer.encode(q_text, add_special_tokens=True, return_tensors="pt").to(device)
+    ans = tokenizer.encode("#### " + sample["answer"], add_special_tokens=False)
+    ans = ans + [tokenizer.eos_token_id]
+    answer_ids = torch.tensor([ans], device=device, dtype=torch.long)
+    return question_ids, answer_ids
+
+
+def _tuning_regularizers(h_steered_seq, truth_vector, alpha_scalar):
+    """Align + magnitude penalties at current α (``alpha_scalar`` may depend on ``theta``)."""
+    h_stack = torch.stack(h_steered_seq, dim=0)
+    direction = F.normalize(truth_vector.float(), p=2, dim=-1)
+    if direction.dim() == 2:
+        direction = direction.squeeze(0)
+    align = -F.cosine_similarity(
+        h_stack.float(), direction.unsqueeze(0).expand_as(h_stack), dim=-1
+    ).mean()
+    sig = h_stack.float().std(dim=-1, keepdim=True)
+    a = alpha_scalar.float()
+    perturb = a * sig * direction
+    mag = (
+        perturb.norm(dim=-1) / h_stack.float().norm(dim=-1).clamp_min(1e-8)
+    ).pow(2).mean()
+    return align, mag
+
+
 def _autocast_context(config):
     if str(config.device).startswith("cuda") and torch.cuda.is_available() and config.bf16:
         return torch.amp.autocast("cuda", dtype=torch.bfloat16)
@@ -60,7 +88,7 @@ def _steering_regularizers(coconut_model, truth_vector):
 
 
 def _loss_for_sample(coconut_model, sample, tokenizer, config, truth_vector, alpha,
-                     include_regularizers=True):
+                     include_regularizers=True, use_kv_cache=True):
     input_ids, attention_mask, labels = _build_teacher_forced_batch(sample, tokenizer, config)
     with _autocast_context(config):
         outputs = coconut_model(
@@ -72,6 +100,7 @@ def _loss_for_sample(coconut_model, sample, tokenizer, config, truth_vector, alp
             gamma=config.alpha_decay,
             collect_steering_stats=True,
             detach_latents=False,
+            use_kv_cache=use_kv_cache,
         )
         answer_loss = outputs.loss.float()
         align_loss, mag_loss = _steering_regularizers(coconut_model, truth_vector)
@@ -88,62 +117,113 @@ def _loss_for_sample(coconut_model, sample, tokenizer, config, truth_vector, alp
     }
 
 
+def _evaluate_steered_accuracy(coconut_model, dataset, tokenizer, config, truth_vector, alpha):
+    """Greedy CCoT accuracy on dataset at scalar/tensor alpha (no gradients)."""
+    if not dataset:
+        return 0.0
+    n_latents = config.max_latent_tokens
+    alpha_f = float(alpha.detach().cpu()) if torch.is_tensor(alpha) else float(alpha)
+    correct = 0
+    for sample in dataset:
+        prompt = _latent_prompt(sample, n_latents)
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(config.device)
+        with torch.no_grad():
+            gen_ids, _, _ = coconut_model.generate_with_latents(
+                input_ids,
+                max_new_tokens=config.max_new_tokens_ccot,
+                temperature=0.0,
+                steering_vector=truth_vector if alpha_f > 0 else None,
+                alpha=alpha,
+                gamma=config.alpha_decay,
+            )
+        predicted = extract_final_answer(tokenizer.decode(gen_ids[0], skip_special_tokens=True))
+        if answers_match(predicted, sample["answer"]):
+            correct += 1
+    return correct / len(dataset)
+
+
 def _evaluate_loss(coconut_model, dataset, tokenizer, config, truth_vector, alpha):
+    """Mean tuning objective (answer CE + regularizers) at fixed α, using ``steered_forward_for_tuning``."""
     if not dataset:
         return float("inf")
+    alpha_t = torch.tensor(
+        float(alpha.detach().cpu()) if torch.is_tensor(alpha) else float(alpha),
+        device=config.device,
+        dtype=torch.float32,
+    )
     losses = []
     for sample in dataset:
         with torch.no_grad():
-            loss, _ = _loss_for_sample(
-                coconut_model,
-                sample,
-                tokenizer,
-                config,
-                truth_vector,
-                alpha,
-                include_regularizers=True,
-            )
+            with _autocast_context(config):
+                q_ids, a_ids = _tokenize_for_alpha_tuning(sample, tokenizer, config.device)
+                L_ans, h_seq = coconut_model.steered_forward_for_tuning(
+                    q_ids,
+                    a_ids,
+                    truth_vector,
+                    config.max_latent_tokens,
+                    gamma=config.alpha_decay,
+                    alpha_tensor=alpha_t,
+                )
+                align, mag = _tuning_regularizers(h_seq, truth_vector, alpha_t)
+                loss = L_ans.float() + config.lambda_align * align + config.lambda_mag * mag
         losses.append(float(loss.detach().cpu()))
     return sum(losses) / len(losses)
 
 
-def _gradient_check(coconut_model, sample, tokenizer, config, truth_vector, alpha_value):
+def _gradient_check_steered(coconut_model, sample, tokenizer, config, truth_vector):
+    """
+    Finite-difference check on θ where α = α_max · σ(θ), using only L_ans from
+    ``steered_forward_for_tuning`` (symmetric difference).
+    """
     eps = config.gradient_check_epsilon
-    alpha = torch.tensor(float(alpha_value), device=config.device, dtype=torch.float32, requires_grad=True)
-    loss, _ = _loss_for_sample(
-        coconut_model,
-        sample,
-        tokenizer,
-        config,
-        truth_vector,
-        alpha,
-        include_regularizers=False,
+    theta = torch.nn.Parameter(
+        torch.tensor(
+            _initial_theta(config.alpha_initial, config.alpha_max),
+            device=config.device,
+            dtype=torch.float32,
+        )
     )
-    loss.backward()
-    analytic = float(alpha.grad.detach().cpu())
+
+    def forward_L_ans():
+        with _autocast_context(config):
+            q_ids, a_ids = _tokenize_for_alpha_tuning(sample, tokenizer, config.device)
+
+            def alpha_fn():
+                return _alpha_from_theta(theta, config.alpha_max)
+
+            L_ans, _ = coconut_model.steered_forward_for_tuning(
+                q_ids,
+                a_ids,
+                truth_vector,
+                config.max_latent_tokens,
+                gamma=config.alpha_decay,
+                alpha_fn=alpha_fn,
+            )
+        return L_ans
+
+    theta.grad = None
+    L = forward_L_ans()
+    L.backward()
+    analytic = float(theta.grad.detach().cpu())
 
     with torch.no_grad():
-        alpha_plus = torch.tensor(float(alpha_value + eps), device=config.device, dtype=torch.float32)
-        alpha_minus = torch.tensor(float(max(alpha_value - eps, 0.0)), device=config.device, dtype=torch.float32)
-        loss_plus, _ = _loss_for_sample(
-            coconut_model, sample, tokenizer, config, truth_vector, alpha_plus,
-            include_regularizers=False,
-        )
-        loss_minus, _ = _loss_for_sample(
-            coconut_model, sample, tokenizer, config, truth_vector, alpha_minus,
-            include_regularizers=False,
-        )
+        orig = theta.data.clone()
+        theta.data.copy_(orig + eps)
+        L_p = forward_L_ans()
+        theta.data.copy_(orig - eps)
+        L_m = forward_L_ans()
+        theta.data.copy_(orig)
 
-    denom_eps = float(alpha_plus.detach().cpu() - alpha_minus.detach().cpu())
-    finite_diff = float((loss_plus - loss_minus).detach().cpu()) / max(denom_eps, 1e-12)
-    rel_error = abs(analytic - finite_diff) / max(abs(analytic), abs(finite_diff), 1e-8)
+    grad_fd = float((L_p - L_m).detach().cpu()) / (2.0 * eps)
+    rel_error = abs(analytic - grad_fd) / max(abs(analytic), abs(grad_fd), 1e-8)
+    passed = rel_error < config.gradient_check_max_rel_error
     return {
-        "alpha": float(alpha_value),
+        "theta_initial": float(orig.detach().cpu()),
         "epsilon": eps,
         "analytic_grad": analytic,
-        "finite_difference_grad": finite_diff,
+        "finite_difference_grad": grad_fd,
         "relative_error": rel_error,
-        "passed": rel_error < config.gradient_check_max_rel_error,
+        "passed": passed,
     }
 
 
@@ -211,7 +291,9 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
     for param in coconut_model.parameters():
         param.requires_grad = False
     coconut_model.eval()
-    truth_vector = F.normalize(truth_vector.to(config.device), p=2, dim=-1)
+    truth_vector = F.normalize(
+        truth_vector.to(config.device), p=2, dim=-1
+    ).to(dtype=torch.float32)
 
     tune_data, early_stop_data = _split_val(
         data_val,
@@ -219,33 +301,45 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
         seed=config.seed,
     )
 
-    theta = torch.nn.Parameter(torch.tensor(
-        _initial_theta(config.alpha_initial, config.alpha_max),
-        device=config.device,
-        dtype=torch.float32,
-    ))
-    optimizer = torch.optim.AdamW([theta], lr=config.alpha_lr)
+    theta = torch.nn.Parameter(
+        torch.tensor(
+            _initial_theta(config.alpha_initial, config.alpha_max),
+            device=config.device,
+            dtype=torch.float32,
+        )
+    )
+    assert theta.dtype == torch.float32, "theta_alpha must be float32 for stable α gradients"
+    optimizer = torch.optim.AdamW([theta], lr=config.alpha_lr, weight_decay=0.0)
 
-    gradient_check = _gradient_check(
+    gradient_check = _gradient_check_steered(
         coconut_model,
         tune_data[0],
         tokenizer,
         config,
         truth_vector,
-        alpha_value=config.alpha_initial,
     )
     print(
-        "Finite-difference alpha gradient check: "
-        f"rel_error={gradient_check['relative_error']:.6f} "
+        "Gradient check (θ → α = α_max·σ(θ), L_ans only): "
+        f"analytic={gradient_check['analytic_grad']:.4e} "
+        f"numeric={gradient_check['finite_difference_grad']:.4e} "
+        f"rel_err={gradient_check['relative_error']:.4f} "
         f"passed={gradient_check['passed']}"
     )
-    if getattr(config, "enforce_gradient_check", True) and not gradient_check["passed"]:
-        raise RuntimeError(
-            "Finite-difference alpha gradient check failed: "
-            f"relative_error={gradient_check['relative_error']:.6f}"
+    if not gradient_check["passed"]:
+        msg = (
+            f"Gradient check FAILED (rel_error={gradient_check['relative_error']:.4f} "
+            f"> {config.gradient_check_max_rel_error}). "
+            "Alpha tuning would be noise. Fix gradient flow first. "
+            f"theta.dtype={theta.dtype}"
         )
+        if getattr(config, "enforce_gradient_check", True):
+            raise AssertionError(msg)
+        print(f"WARNING: {msg} Continuing because enforce_gradient_check=False.")
+    else:
+        print("Gradient check passed — proceeding to alpha tuning.")
 
-    best_es_loss = float("inf")
+    best_es_accuracy = -1.0
+    best_es_loss_at_acc = float("inf")
     best_theta = theta.detach().clone()
     stale_epochs = 0
     training_log = []
@@ -254,21 +348,41 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
         epoch_losses = []
         for sample in tqdm(tune_data, desc=f"Alpha tuning epoch {epoch + 1}"):
             optimizer.zero_grad()
-            alpha = _alpha_from_theta(theta, config.alpha_max)
-            loss, components = _loss_for_sample(
-                coconut_model,
-                sample,
-                tokenizer,
-                config,
-                truth_vector,
-                alpha,
-                include_regularizers=True,
-            )
+            q_ids, a_ids = _tokenize_for_alpha_tuning(sample, tokenizer, config.device)
+
+            def alpha_fn():
+                return _alpha_from_theta(theta, config.alpha_max)
+
+            with _autocast_context(config):
+                L_ans, h_seq = coconut_model.steered_forward_for_tuning(
+                    q_ids,
+                    a_ids,
+                    truth_vector,
+                    config.max_latent_tokens,
+                    gamma=config.alpha_decay,
+                    alpha_fn=alpha_fn,
+                )
+                alpha_now_step = _alpha_from_theta(theta, config.alpha_max)
+                align, mag = _tuning_regularizers(h_seq, truth_vector, alpha_now_step)
+                loss = (
+                    L_ans.float()
+                    + config.lambda_align * align
+                    + config.lambda_mag * mag
+                )
+
             loss.backward()
+            torch.nn.utils.clip_grad_norm_([theta], max_norm=1.0)
             optimizer.step()
 
             loss_value = float(loss.detach().cpu())
-            components.update({"epoch": epoch, "loss": loss_value})
+            components = {
+                "epoch": epoch,
+                "loss": loss_value,
+                "answer_loss": float(L_ans.detach().cpu()),
+                "align_loss": float(align.detach().cpu()),
+                "mag_loss": float(mag.detach().cpu()),
+                "alpha": float(alpha_now_step.detach().cpu()),
+            }
             training_log.append(components)
             epoch_losses.append(loss_value)
 
@@ -282,15 +396,25 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
                 truth_vector,
                 alpha_now,
             )
+            es_accuracy = _evaluate_steered_accuracy(
+                coconut_model,
+                early_stop_data,
+                tokenizer,
+                config,
+                truth_vector,
+                alpha_now,
+            )
 
         mean_epoch_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
         print(
             f"Epoch {epoch + 1}: tune_loss={mean_epoch_loss:.6f} "
-            f"early_stop_loss={es_loss:.6f} alpha={float(alpha_now.cpu()):.4f}"
+            f"D_val_es_acc={es_accuracy:.2%} early_stop_loss={es_loss:.6f} "
+            f"alpha={float(alpha_now.cpu()):.4f}"
         )
 
-        if es_loss < best_es_loss:
-            best_es_loss = es_loss
+        if es_accuracy > best_es_accuracy:
+            best_es_accuracy = es_accuracy
+            best_es_loss_at_acc = es_loss
             best_theta = theta.detach().clone()
             stale_epochs = 0
         else:
@@ -326,7 +450,8 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
         "lambda_mag": config.lambda_mag,
         "tune_examples": len(tune_data),
         "early_stop_examples": len(early_stop_data),
-        "best_early_stop_loss": best_es_loss,
+        "best_early_stop_accuracy": best_es_accuracy,
+        "best_early_stop_loss_at_best_acc": best_es_loss_at_acc,
         "gradient_check": gradient_check,
         "training_log": training_log,
         "diagnostic_sweep": diagnostic_sweep,

@@ -248,10 +248,6 @@ def extract_truth_vector(coconut_model, data_phase2, tokenizer, config, latent_i
 
     duration_s = time.time() - phase2_start
     metadata["duration_s"] = duration_s
-    metadata_path = os.path.join(ckpt_dir, "truth_vector_metadata.json")
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2, default=str)
-    print(f"[LOG] Truth vector metadata saved to {metadata_path}")
 
     if run_dir:
         save_extraction_log(
@@ -263,6 +259,11 @@ def extract_truth_vector(coconut_model, data_phase2, tokenizer, config, latent_i
             duration_s=duration_s,
         )
         save_json_log(run_dir, "truth_vector_metadata.json", metadata)
+    else:
+        metadata_path = os.path.join(ckpt_dir, "truth_vector_metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2, default=str)
+        print(f"[LOG] Truth vector metadata saved to {metadata_path}")
 
     clear_memory()
     return truth_vector, correct_latents, wrong_latents

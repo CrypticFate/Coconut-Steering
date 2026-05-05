@@ -17,9 +17,8 @@ Experiment Visualization/venv/
 # Jupyter Notebook
 .ipynb_checkpoints/
 
-# Model checkpoints & data
+# Model checkpoints & data (weights only — do not ignore whole save_path trees or **/log/**)
 checkpoints/
-checkpoints_*/
 *.pt
 *.pth
 *.bin
@@ -41,6 +40,8 @@ Thumbs.db
 
 # Logs & outputs
 *.log
+# Pipeline stores logs under <save_path>/log/run_*/logs/*.log — keep those trackable
+!**/log/**/*.log
 wandb/
 runs/
 

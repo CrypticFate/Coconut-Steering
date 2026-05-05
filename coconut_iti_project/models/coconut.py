@@ -23,6 +23,8 @@ class Coconut(nn.Module):
         super().__init__()
         self.base_causallm = base_causallm
         self.latent_token_id = latent_token_id
+        self.start_latent_id = start_latent_id
+        self.end_latent_id = end_latent_id
         self.eos_token_id = eos_token_id
         self.embedding = self.base_causallm.get_input_embeddings()
         self.last_steering_stats = []
@@ -100,19 +102,131 @@ class Coconut(nn.Module):
 
         return hidden_states
 
+    def steered_forward_for_tuning(
+        self,
+        question_ids,
+        answer_ids,
+        truth_vector,
+        k,
+        gamma=1.0,
+        alpha_fn=None,
+        alpha_tensor=None,
+        steering_mode="vector",
+    ):
+        """
+        Gradient-safe steered forward for Phase-3 α tuning.
+
+        Prefix embeddings (question + ``<|start-latent|>``) are built under ``torch.no_grad()``;
+        each of ``k`` latent steps recomputes the full prefix + steered slots with
+        ``past_key_values=None`` so no detached KV cache breaks the graph to ``alpha``.
+
+        Pass exactly one of ``alpha_fn`` (trainable, e.g. sigmoid(theta)) or ``alpha_tensor``
+        (fixed scalar α for eval).
+
+        Steering uses float32 math then casts back to the model dtype (stable α gradients under autocast).
+        """
+        if (alpha_fn is None) == (alpha_tensor is None):
+            raise ValueError("Pass exactly one of alpha_fn or alpha_tensor.")
+        if steering_mode != "vector":
+            raise ValueError("steered_forward_for_tuning only supports steering_mode='vector'.")
+
+        device = question_ids.device
+        model_dtype = self.base_causallm.dtype
+        embed = self.embedding
+
+        v_truth = F.normalize(truth_vector.float().to(device), p=2, dim=-1)
+        if v_truth.dim() == 2:
+            v_truth = v_truth.squeeze(0)
+
+        with torch.no_grad():
+            pref = embed(question_ids)
+
+        p = question_ids.shape[1]
+        steered_slots = []
+        h_steered_seq = []
+
+        for t in range(k):
+            inputs_embeds = torch.cat([pref] + steered_slots, dim=1)
+            attn = torch.ones(
+                1, inputs_embeds.shape[1], device=device, dtype=torch.long
+            )
+            pos = torch.arange(
+                0, inputs_embeds.shape[1], dtype=torch.long, device=device
+            ).unsqueeze(0)
+
+            outputs = self.base_causallm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attn,
+                position_ids=pos,
+                past_key_values=None,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            h_t = outputs.hidden_states[-1][:, -1, :]
+
+            h32 = h_t.float()
+            sig = h32.std(dim=-1, keepdim=True)
+            if alpha_tensor is not None:
+                a = alpha_tensor.float()
+            else:
+                a = alpha_fn().float()
+            steer = a * (gamma ** t) * sig * v_truth
+            h_steered = (h32 + steer).to(model_dtype)
+            h_steered_seq.append(h_steered.squeeze(0))
+            steered_slots.append(h_steered.unsqueeze(1))
+
+        end_id = torch.tensor([[self.end_latent_id]], device=device, dtype=torch.long)
+        end_e = embed(end_id)
+        ans_e = embed(answer_ids)
+        full_emb = torch.cat([pref] + steered_slots + [end_e, ans_e], dim=1)
+
+        prompt_len = p + k + 1
+        ans_len = answer_ids.shape[1]
+        labels = torch.full(
+            (1, prompt_len + ans_len),
+            -100,
+            dtype=torch.long,
+            device=device,
+        )
+        labels[0, prompt_len : prompt_len + ans_len] = answer_ids[0]
+
+        attn_full = torch.ones(1, full_emb.shape[1], device=device, dtype=torch.long)
+        pos_full = torch.arange(0, full_emb.shape[1], dtype=torch.long, device=device).unsqueeze(0)
+
+        out_final = self.base_causallm(
+            inputs_embeds=full_emb,
+            attention_mask=attn_full,
+            position_ids=pos_full,
+            past_key_values=None,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+        logits = out_final.logits
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = CrossEntropyLoss()(
+            shift_logits.view(-1, shift_logits.size(-1)).float(),
+            shift_labels.view(-1),
+        )
+        return loss, h_steered_seq
+
     def forward(self, input_ids, attention_mask, labels=None, steering_vector=None, alpha=0.0,
                 gamma=1.0, steering_mode="vector", collect_steering_stats=False,
-                detach_latents=True):
+                detach_latents=True, use_kv_cache=True):
         """
         Custom forward pass that routes hidden states through continuous thought
         and applies ITI steering: h_new = h_old + (alpha * sigma * v_truth)
         
         Includes Qwen RoPE position_ids fix for correct rotary position encoding.
+
+        use_kv_cache: When False, each latent step recomputes activations from position 0 with
+        past_key_values=None. This preserves gradients through alpha during Phase 3 tuning; the
+        cached incremental path can detach the graph across latent steps.
         """
-        logits = []
         latent_sequence = []
         self.last_steering_stats = []
-        
+
         latent_indices = (input_ids == self.latent_token_id).nonzero()
         latent_lists = [
             [idx[1].item() for idx in latent_indices if idx[0] == i]
@@ -121,61 +235,98 @@ class Coconut(nn.Module):
         max_n_latents = max([len(l) for l in latent_lists]) if latent_lists else 0
 
         inputs_embeds = self.embedding(input_ids)
-        # Qwen RoPE fix: explicit position_ids for correct rotary encoding
         position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device).unsqueeze(0)
-        
+
         next_compute_range = (0, input_ids.shape[1])
         if max_n_latents > 0:
             next_compute_range = (0, latent_indices[:, 1].min().item())
 
-        kv_cache = None
+        if not use_kv_cache:
+            for pass_idx in range(max_n_latents):
+                end = next_compute_range[1]
+                outputs = self.base_causallm(
+                    inputs_embeds=inputs_embeds[:, :end],
+                    attention_mask=attention_mask[:, :end],
+                    position_ids=position_ids[:, :end],
+                    past_key_values=None,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+                next_end = input_ids.shape[1] if pass_idx + 1 >= max_n_latents else next_compute_range[1] + 1
+                next_compute_range = (next_compute_range[1], next_end)
 
-        for pass_idx in range(max_n_latents):
-            curr_cache = self._process_kv(kv_cache, next_compute_range[0])
+                hidden_states = outputs.hidden_states[-1]
+                hidden_states = self._apply_steering(
+                    hidden_states=hidden_states,
+                    steering_vector=steering_vector,
+                    alpha=alpha,
+                    gamma=gamma,
+                    pass_idx=pass_idx,
+                    steering_mode=steering_mode,
+                    collect_steering_stats=collect_steering_stats,
+                )
+                latent_sequence.append(hidden_states.detach() if detach_latents else hidden_states)
+                inputs_embeds = inputs_embeds.clone()
+                filling_indices = [(i, l[pass_idx]) for i, l in enumerate(latent_lists) if len(l) > pass_idx]
+                for batch_idx, token_idx in filling_indices:
+                    inputs_embeds[batch_idx, token_idx] = hidden_states[batch_idx, -1]
+
+            outputs = self.base_causallm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+            logits = outputs.logits
+        else:
+            logits = []
+            kv_cache = None
+            for pass_idx in range(max_n_latents):
+                curr_cache = self._process_kv(kv_cache, next_compute_range[0])
+                outputs = self.base_causallm(
+                    inputs_embeds=inputs_embeds[:, next_compute_range[0] : next_compute_range[1]],
+                    attention_mask=attention_mask[:, :next_compute_range[1]],
+                    position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
+                    past_key_values=curr_cache,
+                    output_hidden_states=True,
+                    use_cache=True,
+                )
+                logits.append(outputs.logits)
+
+                next_end = input_ids.shape[1] if pass_idx + 1 >= max_n_latents else next_compute_range[1] + 1
+                next_compute_range = (next_compute_range[1], next_end)
+
+                hidden_states = outputs.hidden_states[-1]
+                hidden_states = self._apply_steering(
+                    hidden_states=hidden_states,
+                    steering_vector=steering_vector,
+                    alpha=alpha,
+                    gamma=gamma,
+                    pass_idx=pass_idx,
+                    steering_mode=steering_mode,
+                    collect_steering_stats=collect_steering_stats,
+                )
+                latent_sequence.append(hidden_states.detach() if detach_latents else hidden_states)
+
+                kv_cache = outputs.past_key_values
+                inputs_embeds = inputs_embeds.clone()
+
+                filling_indices = [(i, l[pass_idx]) for i, l in enumerate(latent_lists) if len(l) > pass_idx]
+                for batch_idx, token_idx in filling_indices:
+                    inputs_embeds[batch_idx, token_idx] = hidden_states[batch_idx, -1]
+
+            final_cache = self._process_kv(kv_cache, next_compute_range[0])
             outputs = self.base_causallm(
                 inputs_embeds=inputs_embeds[:, next_compute_range[0] : next_compute_range[1]],
                 attention_mask=attention_mask[:, :next_compute_range[1]],
-                position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]], 
-                past_key_values=curr_cache,
-                output_hidden_states=True,
-                use_cache=True 
+                position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
+                past_key_values=final_cache,
+                use_cache=True,
             )
             logits.append(outputs.logits)
-
-            next_end = input_ids.shape[1] if pass_idx + 1 >= max_n_latents else next_compute_range[1] + 1
-            next_compute_range = (next_compute_range[1], next_end)
-
-            hidden_states = outputs.hidden_states[-1]
-            
-            hidden_states = self._apply_steering(
-                hidden_states=hidden_states,
-                steering_vector=steering_vector,
-                alpha=alpha,
-                gamma=gamma,
-                pass_idx=pass_idx,
-                steering_mode=steering_mode,
-                collect_steering_stats=collect_steering_stats,
-            )
-
-            latent_sequence.append(hidden_states.detach() if detach_latents else hidden_states)
-            
-            kv_cache = outputs.past_key_values
-            inputs_embeds = inputs_embeds.clone()
-
-            filling_indices = [(i, l[pass_idx]) for i, l in enumerate(latent_lists) if len(l) > pass_idx]
-            for batch_idx, token_idx in filling_indices:
-                inputs_embeds[batch_idx, token_idx] = hidden_states[batch_idx, -1]
-
-        final_cache = self._process_kv(kv_cache, next_compute_range[0])
-        outputs = self.base_causallm(
-            inputs_embeds=inputs_embeds[:, next_compute_range[0] : next_compute_range[1]],
-            attention_mask=attention_mask[:, :next_compute_range[1]],
-            position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]], 
-            past_key_values=final_cache,
-            use_cache=True 
-        )
-        logits.append(outputs.logits)
-        logits = torch.cat(logits, dim=-2)
+            logits = torch.cat(logits, dim=-2)
         
         loss = None
         if labels is not None:
@@ -265,9 +416,14 @@ def initialize_model(config):
     ).to(config.device)
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = tokenizer.eos_token_id
+    # pad_token_id must differ from eos for generate(); pad==eos often stops after one token.
+    added_pad_token = False
+    if tokenizer.pad_token is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        if tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            added_pad_token = True
 
     # Inject Latent Vocabulary
     tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>", "<|latent|>"])
@@ -275,13 +431,17 @@ def initialize_model(config):
         ["<|latent|>", "<|start-latent|>", "<|end-latent|>"]
     )
     model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = tokenizer.pad_token_id
 
     # Initialize ALL custom tokens to prevent initial hidden state corruption
     with torch.no_grad():
         input_embeds = model.get_input_embeddings()
         init_id = tokenizer.encode("The", add_special_tokens=False)[0] 
 
-        for new_token_id in [latent_id, start_id, end_id]:
+        new_ids = [latent_id, start_id, end_id]
+        if added_pad_token:
+            new_ids.append(tokenizer.pad_token_id)
+        for new_token_id in new_ids:
             input_embeds.weight.data[new_token_id] = input_embeds.weight.data[init_id].clone()
             if hasattr(model, 'lm_head') and model.lm_head is not None:
                 model.lm_head.weight.data[new_token_id] = model.lm_head.weight.data[init_id].clone()

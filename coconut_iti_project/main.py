@@ -67,7 +67,8 @@ def main():
     print("=" * 60)
     print("  COCONUT + ITI Steering Pipeline (Qwen 1.5B Math Full Parameter)")
     print("=" * 60)
-    print(f"\nRun Directory: {os.path.abspath(run_dir)}")
+    print(f"\nRun directory: {os.path.abspath(run_dir)}")
+    print(f"(Runs are stored under: {os.path.abspath(os.path.join(config.save_path, 'log'))}/)")
 
     print(f"\nDevice: {config.device}")
     print(f"Model: {config.model_id}")
@@ -201,6 +202,7 @@ def main():
             f"Alpha Decay (gamma): {config.alpha_decay}\n"
             f"Lambda Align: {config.lambda_align}\n"
             f"Lambda Mag: {config.lambda_mag}\n"
+            f"Best D_val_es Accuracy: {alpha_metadata.get('best_early_stop_accuracy')}\n"
             f"Finite Difference Rel Error: {gradient_check.get('relative_error')}\n"
             f"Finite Difference Passed: {gradient_check.get('passed')}\n"
             f"Duration: {phase3_time / 60:.1f} minutes\n"
@@ -227,7 +229,7 @@ def main():
     log_phase(4, "FINAL EXAM (Full Pipeline Evaluation)")
 
     phase4_start = time.time()
-    experiment_results, ablation_results = run_full_evaluation(
+    experiment_results, _results_by_key, sweep_truth_rows, sweep_random_rows = run_full_evaluation(
         coconut_model, test_data, tokenizer, config, truth_vector, latent_id,
         alpha_star=alpha_star,
         run_dir=run_dir,
@@ -251,6 +253,30 @@ def main():
             f"{res['flip_rate']:.2%}     | {res['token_count']:<8.1f} | "
             f"{res['latency']:.3f}s\n"
         )
+    if sweep_truth_rows:
+        phase4_lines.append("\n--- STEERING SWEEP (Truth vector) ---\n")
+        phase4_lines.append(
+            f"{'Condition':<42} | {'Accuracy':<10} | {'Flip':<10} | {'Tokens':<8} | {'Latency'}\n"
+        )
+        phase4_lines.append("-" * 92 + "\n")
+        for res in sweep_truth_rows:
+            phase4_lines.append(
+                f"{res['condition']:<42} | {res['accuracy']:.2%}     | "
+                f"{res['flip_rate']:.2%}     | {res['token_count']:<8.1f} | "
+                f"{res['latency']:.3f}s\n"
+            )
+    if sweep_random_rows:
+        phase4_lines.append("\n--- STEERING SWEEP (Random noise) ---\n")
+        phase4_lines.append(
+            f"{'Condition':<42} | {'Accuracy':<10} | {'Flip':<10} | {'Tokens':<8} | {'Latency'}\n"
+        )
+        phase4_lines.append("-" * 92 + "\n")
+        for res in sweep_random_rows:
+            phase4_lines.append(
+                f"{res['condition']:<42} | {res['accuracy']:.2%}     | "
+                f"{res['flip_rate']:.2%}     | {res['token_count']:<8.1f} | "
+                f"{res['latency']:.3f}s\n"
+            )
     save_phase_log(run_dir, 4, "FINAL EXAM (Full Pipeline Evaluation)",
                    "".join(phase4_lines))
 
@@ -260,10 +286,10 @@ def main():
     print("  PIPELINE COMPLETE")
     print("=" * 60)
     print(f"Total runtime: {total_time / 60:.1f} minutes")
-    print(f"Run directory: {os.path.abspath(run_dir)}")
+    print(f"Run directory (under log/): {os.path.abspath(run_dir)}")
     print(f"  Checkpoints:  {ckpt_dir}/")
     print(f"  Plots:        {plots_dir}/")
-    print(f"  Logs:         {os.path.join(run_dir, 'logs')}/")
+    print(f"  Logs & JSON: {os.path.join(run_dir, 'logs')}/")
 
     # Pipeline summary log
     save_phase_log(run_dir, 0, "PIPELINE SUMMARY", (
@@ -273,14 +299,17 @@ def main():
         f"BF16: {config.bf16}\n"
         f"Total Runtime: {total_time / 60:.1f} minutes\n"
         f"Run Directory: {os.path.abspath(run_dir)}\n\n"
+        f"All artifacts for this run are under: <save_path>/log/run_<timestamp>/\n\n"
         f"Output Structure:\n"
         f"  {run_dir}/\n"
-        f"    config_snapshot.json\n"
         f"    logs/\n"
         f"      pipeline_full.log       (master stdout + stderr)\n"
         f"      training_loss.csv       (per-epoch loss)\n"
         f"      extraction.log          (Phase 2 stats)\n"
         f"      phase4_evaluation.log   (evaluation results)\n"
+        f"      config_snapshot.json\n"
+        f"      alpha_tuning.json, truth_vector_metadata.json\n"
+        f"      phase0_log.txt … phase4_log.txt (phase summaries)\n"
         f"    plots/\n"
         f"      loss_curve.png\n"
         f"      pca_latents.html\n"
@@ -291,11 +320,6 @@ def main():
         f"      stage*_epoch*.pt        (per-stage snapshots)\n"
         f"    results/\n"
         f"      metrics.json\n"
-        f"    phase0_log.txt  (pipeline summary)\n"
-        f"    phase1_log.txt\n"
-        f"    phase2_log.txt\n"
-        f"    phase3_log.txt\n"
-        f"    phase4_log.txt\n"
     ))
 
     # Restore stdout/stderr and close log
