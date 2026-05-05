@@ -121,7 +121,7 @@ class MyCollator:
         return batch
 
 
-def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id):
+def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id, run_dir=None):
     """
     Full-Parameter COCONUT training for Qwen2.5-Math-1.5B.
     Utilizes pure 32-bit torch.optim.AdamW for maximum stability, 
@@ -185,6 +185,7 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
                 loss = outputs.loss.to(torch.float32) / config.gradient_accumulation_steps
 
             loss.backward()
+            total_loss += loss.item() * config.gradient_accumulation_steps
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 # 2. Relaxed Clipping (1.0) since we are in stable 32-bit precision
@@ -198,13 +199,14 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
                 del loss
                 torch.cuda.empty_cache()
 
-            total_loss += loss.item() * config.gradient_accumulation_steps if 'loss' in locals() else total_loss
             pbar.set_postfix({"loss": total_loss / (step + 1)})
 
         epoch_avg_loss = total_loss / max(len(train_loader), 1)
         loss_history.append(epoch_avg_loss)
 
-    checkpoint_path = os.path.join(config.save_path, "coconut_phase1.pt")
+    ckpt_dir = os.path.join(run_dir, "checkpoints") if run_dir else config.save_path
+    os.makedirs(ckpt_dir, exist_ok=True)
+    checkpoint_path = os.path.join(ckpt_dir, "coconut_phase1.pt")
     torch.save(coconut_model.state_dict(), checkpoint_path)
     print(f"Phase 1 checkpoint saved to {checkpoint_path}")
 

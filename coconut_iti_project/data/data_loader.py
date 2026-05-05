@@ -123,31 +123,55 @@ def prepare_datasets(config, include_val=False):
 
     # Parse all examples
     all_train_parsed = [parse_gsm(ex, qid=f"train_{i:05d}") for i, ex in enumerate(raw_train)]
-    test_data = [parse_gsm(ex, qid=f"test_{i:05d}") for i, ex in enumerate(raw_test)]
+    all_test_parsed = [parse_gsm(ex, qid=f"test_{i:05d}") for i, ex in enumerate(raw_test)]
 
-    # Split train: preserve the existing Phase 1 split point, then carve
-    # disjoint D_steer and D_val from the reserved tail.
+    # Optional small-pool mode for fast pipeline tests.
+    train_pool_size = min(getattr(config, "train_pool_size", len(all_train_parsed)), len(all_train_parsed))
+    test_pool_size = min(getattr(config, "test_pool_size", len(all_test_parsed)), len(all_test_parsed))
+    all_train_parsed = all_train_parsed[:train_pool_size]
+    test_data = all_test_parsed[:test_pool_size]
+
+    # Split train: D_train + reserved tail, then carve disjoint D_steer and D_val.
     reserved = min(config.protocol_reserved_examples, len(all_train_parsed))
     split_point = len(all_train_parsed) - reserved
-    data_phase1 = all_train_parsed[:split_point]
+    data_phase1_total = all_train_parsed[:split_point]
     protocol_tail = all_train_parsed[split_point:]
     steer_count = min(config.phase2_steer_examples, len(protocol_tail))
     data_phase2 = protocol_tail[:steer_count]
     data_val = protocol_tail[steer_count:]
 
+    # Internal 90/10 split of D_train:
+    # - D_train-actual: used for curriculum training
+    # - D_train-val: used only for checkpoint selection
+    phase1_train_fraction = getattr(config, "phase1_train_fraction", 0.9)
+    n_phase1_actual = int(round(len(data_phase1_total) * phase1_train_fraction))
+    n_phase1_actual = min(max(n_phase1_actual, 1), max(len(data_phase1_total) - 1, 1))
+    data_phase1 = data_phase1_total[:n_phase1_actual]
+    data_phase1_val = data_phase1_total[n_phase1_actual:]
+
     train_qids = {ex["qid"] for ex in data_phase1}
+    train_val_qids = {ex["qid"] for ex in data_phase1_val}
     steer_qids = {ex["qid"] for ex in data_phase2}
     val_qids = {ex["qid"] for ex in data_val}
     test_qids = {ex["qid"] for ex in test_data}
+    assert train_qids.isdisjoint(train_val_qids)
     assert train_qids.isdisjoint(steer_qids)
     assert train_qids.isdisjoint(val_qids)
+    assert train_val_qids.isdisjoint(steer_qids)
+    assert train_val_qids.isdisjoint(val_qids)
     assert steer_qids.isdisjoint(val_qids)
-    assert test_qids.isdisjoint(train_qids | steer_qids | val_qids)
+    assert test_qids.isdisjoint(train_qids | train_val_qids | steer_qids | val_qids)
 
     print("\n" + "=" * 50)
-    print(f"Phase 1 (Training):                {len(data_phase1):,} examples")
+    print(f"Phase 1 (D_train total):           {len(data_phase1_total):,} examples")
+    print(f"  - D_train-actual (90%):          {len(data_phase1):,} examples")
+    print(f"  - D_train-val (10%):             {len(data_phase1_val):,} examples")
     print(f"Phase 2 (Truth Vector Extraction): {len(data_phase2):,} examples")
-    print(f"Phase 3 (Alpha Tuning):            {len(data_val):,} examples")
+    print(f"Phase 3 (D_val total):             {len(data_val):,} examples")
+    val_tune = int(round(len(data_val) * getattr(config, "alpha_tune_fraction", 0.9)))
+    val_tune = min(max(val_tune, 1), max(len(data_val) - 1, 1)) if len(data_val) > 1 else len(data_val)
+    print(f"  - D_val-tune (~90%):             {val_tune:,} examples")
+    print(f"  - D_val-es (~10%):               {len(data_val) - val_tune:,} examples")
     print(f"Phase 4 (Locked Test Set):         {len(test_data):,} examples")
     print("=" * 50 + "\n")
 

@@ -152,7 +152,7 @@ def _split_val(data_val, tune_fraction, seed):
     random.Random(seed).shuffle(data)
     if len(data) <= 1:
         return data, data
-    n_tune = max(1, int(len(data) * tune_fraction))
+    n_tune = max(1, int(round(len(data) * tune_fraction)))
     n_tune = min(n_tune, len(data) - 1)
     return data[:n_tune], data[n_tune:]
 
