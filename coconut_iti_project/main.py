@@ -12,34 +12,18 @@ import time
 
 import torch
 
+from core.alpha_tuner import tune_alpha
 from configs.config import Config, set_seed
 from core.evaluator import run_full_evaluation, print_sample_outputs
 from core.extractor import extract_truth_vector
 from core.trainer import train_phase1
 from data.data_loader import prepare_datasets
 from models.coconut import initialize_model
-from utils.helpers import clear_memory, save_phase_log
-from utils.visualizer import plot_latent_pca, plot_loss_curve
-
-
-class TeeLogger:
-    """Writes all stdout to both the terminal and a log file simultaneously."""
-    def __init__(self, filepath):
-        self.terminal = sys.stdout
-        self.log = open(filepath, "a")
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
-
-    def close(self):
-        self.log.close()
-        sys.stdout = self.terminal
+from utils.helpers import (
+    clear_memory, save_phase_log, save_config_snapshot,
+    setup_run_directory, activate_logging, deactivate_logging,
+)
+from utils.visualizer import plot_loss_curve, plot_latent_pca
 
 
 def log_phase(phase_num, phase_name):
@@ -58,22 +42,32 @@ def main():
         "--skip-phase2", action="store_true",
         help="Skip Phase 2 extraction and load truth_vector from checkpoints/truth_vector.pt",
     )
+    parser.add_argument(
+        "--skip-phase3", action="store_true",
+        help="Skip Phase 3 alpha tuning and load alpha_star from checkpoints/alpha_star.pt",
+    )
     args = parser.parse_args()
 
     config = Config()
     set_seed(config.seed)
     os.makedirs(config.save_path, exist_ok=True)
 
-    # --- Pipeline-level log: capture ALL stdout to a master log file ---
-    master_log_path = os.path.join(config.save_path, "pipeline_full.log")
-    tee = TeeLogger(master_log_path)
-    sys.stdout = tee
+    # =========================================================
+    # Create a timestamped run directory for ALL outputs
+    # =========================================================
+    run_dir = setup_run_directory(config.save_path)
+    plots_dir = os.path.join(run_dir, "plots")
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+
+    # Capture BOTH stdout AND stderr to the master log
+    stdout_tee, stderr_tee = activate_logging(run_dir)
 
     pipeline_start = time.time()
 
     print("=" * 60)
     print("  COCONUT + ITI Steering Pipeline (Qwen 1.5B Math Full Parameter)")
     print("=" * 60)
+    print(f"\nRun Directory: {os.path.abspath(run_dir)}")
 
     print(f"\nDevice: {config.device}")
     print(f"Model: {config.model_id}")
@@ -83,11 +77,14 @@ def main():
     print(f"Epochs: {config.num_epochs_total}")
     print(f"Alpha sweep: {config.alpha_sweep}")
 
+    # Save config snapshot for reproducibility
+    save_config_snapshot(run_dir, config)
+
     # --- Data ---
     print("\n" + "-" * 60)
     print("  Loading Datasets")
     print("-" * 60)
-    data_phase1, data_phase2, test_data = prepare_datasets(config)
+    data_phase1, data_phase2, data_val, test_data = prepare_datasets(config, include_val=True)
 
     # --- Model ---
     print("\n" + "-" * 60)
@@ -103,16 +100,17 @@ def main():
     if not args.skip_phase1:
         phase1_start = time.time()
         loss_history = train_phase1(
-            coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id
+            coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id,
+            run_dir=run_dir,
         )
         phase1_time = time.time() - phase1_start
         print(f"\nPhase 1 completed in {phase1_time / 60:.1f} minutes")
         print(f"Final training loss: {loss_history[-1]:.4f}")
 
-        plot_loss_curve(loss_history, os.path.join(config.save_path, "loss_curve.png"))
+        plot_loss_curve(loss_history, os.path.join(plots_dir, "loss_curve.png"))
         print_sample_outputs(coconut_model, tokenizer, test_data, config, phase_name="PHASE 1 (BASE)")
 
-        save_phase_log(config.save_path, 1, "SILENT THINKING (Full Parameter COCONUT Training)", (
+        save_phase_log(run_dir, 1, "SILENT THINKING (Full Parameter COCONUT Training)", (
             f"Model: {config.model_id}\n"
             f"Training Mode: Full Parameter (Native 32-bit AdamW)\n"
             f"Epochs: {config.num_epochs_total}\n"
@@ -125,7 +123,7 @@ def main():
             f"Final Loss: {loss_history[-1]:.6f}\n"
             f"Min Loss: {min(loss_history):.6f}\n"
             f"Duration: {phase1_time / 60:.1f} minutes\n"
-            f"Checkpoint: {os.path.join(config.save_path, 'coconut_phase1.pt')}\n"
+            f"Checkpoint: {os.path.join(ckpt_dir, 'coconut_phase1.pt')}\n"
         ))
     else:
         checkpoint_path = os.path.join(config.save_path, "coconut_phase1.pt")
@@ -133,7 +131,7 @@ def main():
         coconut_model.load_state_dict(torch.load(checkpoint_path, map_location=config.device))
         print("[SKIP] Checkpoint loaded successfully.")
 
-        save_phase_log(config.save_path, 1, "SILENT THINKING (Full Parameter COCONUT Training)", (
+        save_phase_log(run_dir, 1, "SILENT THINKING (Full Parameter COCONUT Training)", (
             f"SKIPPED: Loaded from checkpoint\n"
             f"Checkpoint: {checkpoint_path}\n"
         ))
@@ -148,29 +146,33 @@ def main():
     if not args.skip_phase2:
         phase2_start = time.time()
         truth_vector, correct_latents, wrong_latents = extract_truth_vector(
-            coconut_model, data_phase2, tokenizer, config, latent_id, start_id, end_id
+            coconut_model, data_phase2, tokenizer, config, latent_id, start_id, end_id,
+            run_dir=run_dir,
         )
         phase2_time = time.time() - phase2_start
         print(f"\nPhase 2 completed in {phase2_time / 60:.1f} minutes")
 
-        plot_latent_pca(correct_latents, wrong_latents, os.path.join(config.save_path, "pca_latents.html"))
+        plot_latent_pca(correct_latents, wrong_latents, os.path.join(plots_dir, "pca_latents.html"))
 
-        save_phase_log(config.save_path, 2, "MIND READING (Global Truth Vector Extraction)", (
+        save_phase_log(run_dir, 2, "MIND READING (Global Truth Vector Extraction)", (
             f"Extraction Samples: {len(data_phase2)}\n"
             f"Correct Latent Paths: {len(correct_latents)}\n"
             f"Incorrect Latent Paths: {len(wrong_latents)}\n"
             f"Truth Vector Shape: {truth_vector.shape}\n"
             f"Truth Vector L2 Norm: {torch.norm(truth_vector).item():.6f}\n"
             f"Duration: {phase2_time / 60:.1f} minutes\n"
-            f"Vector Saved: {os.path.join(config.save_path, 'truth_vector.pt')}\n"
+            f"Vector Saved: {os.path.join(ckpt_dir, 'truth_vector.pt')}\n"
         ))
     else:
-        vector_path = os.path.join(config.save_path, "truth_vector.pt")
+        vector_path = (
+            config.truth_vector_path
+            or os.path.join(config.save_path, "truth_vector.pt")
+        )
         print(f"[SKIP] Loading truth vector from {vector_path}...")
         truth_vector = torch.load(vector_path, map_location=config.device)
         print(f"[SKIP] Truth vector loaded. Shape: {truth_vector.shape}")
 
-        save_phase_log(config.save_path, 2, "MIND READING (Global Truth Vector Extraction)", (
+        save_phase_log(run_dir, 2, "MIND READING (Global Truth Vector Extraction)", (
             f"SKIPPED: Loaded from file\n"
             f"Vector Path: {vector_path}\n"
             f"Truth Vector Shape: {truth_vector.shape}\n"
@@ -179,20 +181,45 @@ def main():
     clear_memory()
 
     # =========================================================
-    # Phase 3: Mind Control (Intervention Setup)
+    # Phase 3: Mind Control (Alpha Tuning)
     # =========================================================
-    log_phase(3, "MIND CONTROL (Intervention Setup)")
-    print("Steering vector is embedded in the COCONUT forward pass.")
-    print(f"Alpha decay (gamma): {config.alpha_decay}")
-    print(f"Intervention formula: h_new = h_old + (alpha * sigma * v_truth)")
-    print("Phase 3 logic is built into the model architecture -- no separate step needed.")
+    log_phase(3, "MIND CONTROL (Gradient-Based Alpha Tuning)")
 
-    save_phase_log(config.save_path, 3, "MIND CONTROL (Intervention Setup)", (
-        f"Alpha Decay (gamma): {config.alpha_decay}\n"
-        f"Alpha Sweep Values: {config.alpha_sweep}\n"
-        f"Intervention Formula: h_new = h_old + (alpha * sigma * v_truth)\n"
-        f"Note: Steering logic is embedded in the Coconut forward pass.\n"
-    ))
+    if not args.skip_phase3:
+        phase3_start = time.time()
+        alpha_star, alpha_metadata = tune_alpha(
+            coconut_model, data_val, tokenizer, config, truth_vector, run_dir=run_dir
+        )
+        phase3_time = time.time() - phase3_start
+        gradient_check = alpha_metadata.get("gradient_check", {})
+        print(f"\nPhase 3 completed in {phase3_time / 60:.1f} minutes")
+
+        save_phase_log(run_dir, 3, "MIND CONTROL (Gradient-Based Alpha Tuning)", (
+            f"Validation Samples: {len(data_val)}\n"
+            f"Alpha*: {float(alpha_star.detach().cpu()):.6f}\n"
+            f"Alpha Max: {config.alpha_max}\n"
+            f"Alpha Decay (gamma): {config.alpha_decay}\n"
+            f"Lambda Align: {config.lambda_align}\n"
+            f"Lambda Mag: {config.lambda_mag}\n"
+            f"Finite Difference Rel Error: {gradient_check.get('relative_error')}\n"
+            f"Finite Difference Passed: {gradient_check.get('passed')}\n"
+            f"Duration: {phase3_time / 60:.1f} minutes\n"
+            f"Alpha Saved: {os.path.join(ckpt_dir, 'alpha_star.pt')}\n"
+        ))
+    else:
+        alpha_path = (
+            config.alpha_star_path
+            or os.path.join(config.save_path, "alpha_star.pt")
+        )
+        print(f"[SKIP] Loading alpha* from {alpha_path}...")
+        alpha_star = torch.load(alpha_path, map_location=config.device)
+        print(f"[SKIP] alpha* loaded: {float(alpha_star.detach().cpu()):.6f}")
+
+        save_phase_log(run_dir, 3, "MIND CONTROL (Gradient-Based Alpha Tuning)", (
+            f"SKIPPED: Loaded from file\n"
+            f"Alpha Path: {alpha_path}\n"
+            f"Alpha*: {float(alpha_star.detach().cpu()):.6f}\n"
+        ))
 
     # =========================================================
     # Phase 4: Final Exam (Full Evaluation)
@@ -201,7 +228,9 @@ def main():
 
     phase4_start = time.time()
     experiment_results, ablation_results = run_full_evaluation(
-        coconut_model, test_data, tokenizer, config, truth_vector, latent_id
+        coconut_model, test_data, tokenizer, config, truth_vector, latent_id,
+        alpha_star=alpha_star,
+        run_dir=run_dir,
     )
     phase4_time = time.time() - phase4_start
     print(f"\nPhase 4 completed in {phase4_time / 60:.1f} minutes")
@@ -209,24 +238,20 @@ def main():
     # Build Phase 4 log content
     phase4_lines = [
         f"Test Samples: {len(test_data)}\n",
-        f"Alpha Sweep: {config.alpha_sweep}\n",
+        f"Alpha*: {float(alpha_star.detach().cpu()):.6f}\n",
         f"Alpha Decay (gamma): {config.alpha_decay}\n",
         f"Duration: {phase4_time / 60:.1f} minutes\n\n",
-        "--- STRUCTURAL ABLATIONS ---\n",
-        f"No CoT:              Accuracy {ablation_results['no_cot'][0]:.2%} | Avg Tokens: {ablation_results['no_cot'][1]:.1f}\n",
-        f"Text-based CoT:      Accuracy {ablation_results['text_cot'][0]:.2%} | Avg Tokens: {ablation_results['text_cot'][1]:.1f}\n",
-        f"Just CCoT:           Accuracy {ablation_results['ccot'][0]:.2%} | Avg Tokens: {ablation_results['ccot'][1]:.1f}\n",
-        f"Random Noise:        Accuracy {ablation_results['random'][0]:.2%} | Avg Tokens: {ablation_results['random'][1]:.1f}\n\n",
-        "--- ITI SWEEP ---\n",
-        f"{'Alpha':<8} | {'Accuracy':<10} | {'Flip Rate':<10} | {'Faithfulness'}\n",
-        "-" * 50 + "\n",
+        "--- FINAL CONDITIONS ---\n",
+        f"{'Condition':<30} | {'Accuracy':<10} | {'Flip Rate':<10} | {'Tokens':<8} | {'Latency'}\n",
+        "-" * 86 + "\n",
     ]
     for res in experiment_results:
         phase4_lines.append(
-            f"{res['alpha']:<8} | {res['accuracy']:.2%}     | "
-            f"{res['flip_rate']:.2%}     | {res['trajectory_faithfulness']:.4f}\n"
+            f"{res['condition']:<30} | {res['accuracy']:.2%}     | "
+            f"{res['flip_rate']:.2%}     | {res['token_count']:<8.1f} | "
+            f"{res['latency']:.3f}s\n"
         )
-    save_phase_log(config.save_path, 4, "FINAL EXAM (Full Pipeline Evaluation)",
+    save_phase_log(run_dir, 4, "FINAL EXAM (Full Pipeline Evaluation)",
                    "".join(phase4_lines))
 
     # --- Summary ---
@@ -235,31 +260,46 @@ def main():
     print("  PIPELINE COMPLETE")
     print("=" * 60)
     print(f"Total runtime: {total_time / 60:.1f} minutes")
-    print(f"Checkpoints saved to: {os.path.abspath(config.save_path)}")
-    print(f"Loss curve: {os.path.join(config.save_path, 'loss_curve.png')}")
-    print(f"PCA plot: {os.path.join(config.save_path, 'pca_latents.html')}")
-    print(f"Master log: {master_log_path}")
-    print(f"Evaluation log: {os.path.join(config.save_path, 'phase4_evaluation.log')}")
+    print(f"Run directory: {os.path.abspath(run_dir)}")
+    print(f"  Checkpoints:  {ckpt_dir}/")
+    print(f"  Plots:        {plots_dir}/")
+    print(f"  Logs:         {os.path.join(run_dir, 'logs')}/")
 
     # Pipeline summary log
-    save_phase_log(config.save_path, 0, "PIPELINE SUMMARY", (
+    save_phase_log(run_dir, 0, "PIPELINE SUMMARY", (
         f"Model: {config.model_id}\n"
         f"Training Mode: Full Parameter (Native 32-bit AdamW)\n"
         f"Device: {config.device}\n"
         f"BF16: {config.bf16}\n"
         f"Total Runtime: {total_time / 60:.1f} minutes\n"
-        f"Checkpoints Directory: {os.path.abspath(config.save_path)}\n\n"
-        f"Log Files:\n"
-        f"  - {os.path.join(config.save_path, 'pipeline_full.log')} (master)\n"
-        f"  - {os.path.join(config.save_path, 'phase4_evaluation.log')}\n"
-        f"  - {os.path.join(config.save_path, 'phase1_log.txt')}\n"
-        f"  - {os.path.join(config.save_path, 'phase2_log.txt')}\n"
-        f"  - {os.path.join(config.save_path, 'phase3_log.txt')}\n"
-        f"  - {os.path.join(config.save_path, 'phase4_log.txt')}\n"
+        f"Run Directory: {os.path.abspath(run_dir)}\n\n"
+        f"Output Structure:\n"
+        f"  {run_dir}/\n"
+        f"    config_snapshot.json\n"
+        f"    logs/\n"
+        f"      pipeline_full.log       (master stdout + stderr)\n"
+        f"      training_loss.csv       (per-epoch loss)\n"
+        f"      extraction.log          (Phase 2 stats)\n"
+        f"      phase4_evaluation.log   (evaluation results)\n"
+        f"    plots/\n"
+        f"      loss_curve.png\n"
+        f"      pca_latents.html\n"
+        f"    checkpoints/\n"
+        f"      coconut_phase1.pt\n"
+        f"      truth_vector.pt\n"
+        f"      alpha_star.pt\n"
+        f"      stage*_epoch*.pt        (per-stage snapshots)\n"
+        f"    results/\n"
+        f"      metrics.json\n"
+        f"    phase0_log.txt  (pipeline summary)\n"
+        f"    phase1_log.txt\n"
+        f"    phase2_log.txt\n"
+        f"    phase3_log.txt\n"
+        f"    phase4_log.txt\n"
     ))
 
-    # Restore stdout and close log
-    tee.close()
+    # Restore stdout/stderr and close log
+    deactivate_logging(stdout_tee, stderr_tee)
 
 
 if __name__ == "__main__":
