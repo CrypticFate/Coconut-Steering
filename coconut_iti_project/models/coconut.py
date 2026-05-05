@@ -25,6 +25,9 @@ class Coconut(nn.Module):
         self.latent_token_id = latent_token_id
         self.eos_token_id = eos_token_id
         self.embedding = self.base_causallm.get_input_embeddings()
+        self.last_steering_stats = []
+        self.last_generation_latents = []
+        self.last_trajectory_faithfulness = 0.0
 
     def _process_kv(self, kv_cache, keep_len):
         if kv_cache is None:
@@ -42,7 +45,56 @@ class Coconut(nn.Module):
             new_cache.update(k[..., :keep_len, :], v[..., :keep_len, :], layer_idx=i)
         return new_cache
 
-    def forward(self, input_ids, attention_mask, labels=None, steering_vector=None, alpha=0.0, gamma=1.0):
+    def _alpha_tensor(self, alpha, device, dtype):
+        if torch.is_tensor(alpha):
+            return alpha.to(device=device, dtype=dtype)
+        return torch.tensor(float(alpha), device=device, dtype=dtype)
+
+    def _prepare_direction(self, steering_vector, hidden_states, mode):
+        vector = steering_vector.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        if mode == "subspace":
+            if vector.dim() != 2:
+                raise ValueError("Subspace steering expects a [hidden, k] matrix.")
+            return vector
+        if vector.dim() == 1:
+            vector = vector.unsqueeze(0)
+        return F.normalize(vector, p=2, dim=-1)
+
+    def _apply_steering(self, hidden_states, steering_vector, alpha, gamma, pass_idx,
+                        steering_mode, collect_steering_stats):
+        if steering_vector is None:
+            return hidden_states
+
+        h_t = hidden_states[:, -1, :]
+        d_model = h_t.shape[-1]
+        alpha_t = self._alpha_tensor(alpha, h_t.device, h_t.dtype) * (gamma ** pass_idx)
+        sigma_t = h_t.norm(dim=-1, keepdim=True) / (d_model ** 0.5)
+        direction = self._prepare_direction(steering_vector, hidden_states, steering_mode)
+
+        if steering_mode == "subspace":
+            h_unit = F.normalize(h_t, p=2, dim=-1)
+            projection = h_unit @ direction @ direction.T
+            intervention = alpha_t * sigma_t * projection
+        else:
+            intervention = alpha_t * sigma_t * direction
+
+        steered_h = h_t + intervention
+        hidden_states = hidden_states.clone()
+        hidden_states[:, -1, :] = steered_h
+
+        if collect_steering_stats:
+            self.last_steering_stats.append({
+                "h_before": h_t,
+                "h_after": steered_h,
+                "intervention": intervention,
+                "direction": direction,
+            })
+
+        return hidden_states
+
+    def forward(self, input_ids, attention_mask, labels=None, steering_vector=None, alpha=0.0,
+                gamma=1.0, steering_mode="vector", collect_steering_stats=False,
+                detach_latents=True):
         """
         Custom forward pass that routes hidden states through continuous thought
         and applies ITI steering: h_new = h_old + (alpha * sigma * v_truth)
@@ -51,6 +103,7 @@ class Coconut(nn.Module):
         """
         logits = []
         latent_sequence = []
+        self.last_steering_stats = []
         
         latent_indices = (input_ids == self.latent_token_id).nonzero()
         latent_lists = [
@@ -86,14 +139,17 @@ class Coconut(nn.Module):
 
             hidden_states = outputs.hidden_states[-1]
             
-            # --- Dynamic Alpha Decay ITI ---
-            current_alpha = alpha * (gamma ** pass_idx)
-            if steering_vector is not None and current_alpha > 0:
-                sigma_l = hidden_states.std(dim=-1, keepdim=True)
-                norm_dir = F.normalize(steering_vector, p=2, dim=-1).to(hidden_states.device)
-                hidden_states = hidden_states + (current_alpha * sigma_l * norm_dir)
+            hidden_states = self._apply_steering(
+                hidden_states=hidden_states,
+                steering_vector=steering_vector,
+                alpha=alpha,
+                gamma=gamma,
+                pass_idx=pass_idx,
+                steering_mode=steering_mode,
+                collect_steering_stats=collect_steering_stats,
+            )
 
-            latent_sequence.append(hidden_states.detach())
+            latent_sequence.append(hidden_states.detach() if detach_latents else hidden_states)
             
             kv_cache = outputs.past_key_values
             inputs_embeds = inputs_embeds.clone()
@@ -123,7 +179,8 @@ class Coconut(nn.Module):
         return Outputs(loss, inputs_embeds, logits, latent_sequence)
 
     def generate_with_latents(self, input_ids, max_new_tokens=128, temperature=0.0,
-                              steering_vector=None, alpha=0.0, gamma=1.0):
+                              steering_vector=None, alpha=0.0, gamma=1.0,
+                              steering_mode="vector"):
         """Deterministic generation with continuous thought and optional ITI steering."""
         self.eval()
         tokens = input_ids.tolist()[0]
@@ -135,20 +192,24 @@ class Coconut(nn.Module):
                 steering_vector=steering_vector,
                 alpha=alpha,
                 gamma=gamma,
+                steering_mode=steering_mode,
             )
-            
+
+        latent_steps = [h[:, -1, :].detach().cpu() for h in outputs.latent_sequence]
+        self.last_generation_latents = latent_steps
+
         mean_latent = (
-            torch.mean(torch.stack([h[:, -1, :] for h in outputs.latent_sequence]), dim=0).cpu()
-            if outputs.latent_sequence
+            torch.mean(torch.stack(latent_steps), dim=0)
+            if latent_steps
             else None
         )
-        
-        faithfulness_scores = []
-        if steering_vector is not None and outputs.latent_sequence and alpha > 0.0:
-            for h in outputs.latent_sequence:
-                sim = F.cosine_similarity(h[:, -1, :], steering_vector.unsqueeze(0), dim=-1)
-                faithfulness_scores.append(sim.item())
-        avg_faithfulness = np.mean(faithfulness_scores) if faithfulness_scores else 0.0
+
+        trajectory_scores = []
+        if len(latent_steps) > 1:
+            for h_prev, h_next in zip(latent_steps[:-1], latent_steps[1:]):
+                trajectory_scores.append(F.cosine_similarity(h_prev, h_next, dim=-1).item())
+        avg_faithfulness = float(np.mean(trajectory_scores)) if trajectory_scores else 0.0
+        self.last_trajectory_faithfulness = avg_faithfulness
 
         if temperature > 0:
             scaled_logits = outputs.logits[:, -1, :] / temperature
