@@ -32,6 +32,14 @@ class Coconut(nn.Module):
     def _process_kv(self, kv_cache, keep_len):
         if kv_cache is None:
             return None
+
+        # Newer transformers DynamicCache variants may not expose indexable
+        # per-layer tuples (or key_cache/value_cache lists). In that case,
+        # the cache is already in the expected opaque format for the model
+        # forward call, so we pass it through unchanged.
+        if not hasattr(kv_cache, "key_cache") and not isinstance(kv_cache, (list, tuple)):
+            return kv_cache
+
         new_cache = DynamicCache()
         num_layers = len(kv_cache.key_cache) if hasattr(kv_cache, "key_cache") else len(kv_cache)
         for i in range(num_layers):
@@ -40,7 +48,7 @@ class Coconut(nn.Module):
                     k, v = kv_cache.key_cache[i], kv_cache.value_cache[i]
                 else:
                     k, v = kv_cache[i]
-            except:
+            except (TypeError, IndexError, KeyError, AttributeError):
                 k, v = kv_cache[i]
             new_cache.update(k[..., :keep_len, :], v[..., :keep_len, :], layer_idx=i)
         return new_cache

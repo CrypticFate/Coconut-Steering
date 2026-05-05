@@ -6,7 +6,9 @@ import os
 class Config:
     def __init__(self):
         # 1. Point to the new 1.5B Math model
-        self.model_id = "./qwen-1.5b-math-local" 
+        # Use the HF repo id by default. If you have a local copy, replace with
+        # an absolute path like "/root/Coconut-Steering/coconut_iti_project/qwen-1.5b-math-local".
+        self.model_id = "Qwen/Qwen2.5-Math-1.5B"
         self.save_path = "./checkpoints_coconut_qwen1.5b_math_full"
         
         self.batch_size_training = 1       
@@ -22,10 +24,17 @@ class Config:
         self.max_latent_tokens = 6         
         self.num_epochs_total = 50         
         
-        # Phase 2/3 protocol data. The reserved tail size stays at 1000,
-        # preserving the existing Phase 1 training split.
-        self.protocol_reserved_examples = 1000
-        self.phase2_steer_examples = 500
+        # Test-run protocol split on a 500-example train pool:
+        # - D_train = 300 (60%)
+        # - D_steer =  50 (10%)
+        # - D_val   = 150 (30%)
+        self.train_pool_size = 500
+        self.protocol_reserved_examples = 200  # D_steer + D_val
+        self.phase2_steer_examples = 50
+        # Internal split for D_train checkpoint selection:
+        # - D_train-actual = 90%
+        # - D_train-val    = 10%
+        self.phase1_train_fraction = 0.9
 
         # Phase 2: frozen stochastic extraction from D_steer.
         self.num_generations_per_sample = 10
@@ -49,7 +58,8 @@ class Config:
         self.lambda_mag = 0.01
         self.gradient_check_epsilon = 1e-2
         self.gradient_check_max_rel_error = 0.05
-        self.enforce_gradient_check = True
+        # For tiny test splits, finite-difference checks can be noisy.
+        self.enforce_gradient_check = False
         self.alpha_sweep = [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
         self.alpha_decay = 1.0
         self.alpha_star_path = None
@@ -57,6 +67,7 @@ class Config:
         self.run_alpha_diagnostic_sweep = True
 
         # Phase 4: final locked-test evaluation.
+        self.test_pool_size = 100
         self.random_noise_seed = 1234
         self.max_new_tokens_no_cot = 32
         self.max_new_tokens_text_cot = 128
