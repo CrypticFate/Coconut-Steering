@@ -1,5 +1,6 @@
 import gc
 import json
+import math
 import os
 import time
 
@@ -104,7 +105,7 @@ def _legacy_run_full_evaluation(coconut_model, test_data, tokenizer, config, tru
         with torch.no_grad():
             out_ids = base_model.generate(
                 input_ids, max_new_tokens=32, do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
             )
         total_tokens += out_ids.shape[1] - input_ids.shape[1]
         pred = _extract_answer(tokenizer.decode(out_ids[0], skip_special_tokens=True))
@@ -122,7 +123,7 @@ def _legacy_run_full_evaluation(coconut_model, test_data, tokenizer, config, tru
         with torch.no_grad():
             out_ids = base_model.generate(
                 input_ids, max_new_tokens=128, do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
             )
         total_tokens += out_ids.shape[1] - input_ids.shape[1]
         pred = _extract_answer(tokenizer.decode(out_ids[0], skip_special_tokens=True))
@@ -384,7 +385,7 @@ def _evaluate_direct_v2(base_model, test_data, tokenizer, config, mode):
                 input_ids,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
             )
         latencies.append(time.perf_counter() - start)
         generated_tokens = out_ids.shape[1] - input_ids.shape[1]
@@ -424,6 +425,23 @@ def _evaluate_ccot_v2(coconut_model, test_data, tokenizer, config, steering_vect
         correctness.append(answers_match(predicted, sample["answer"]))
 
     return correctness, token_counts, latencies, faithfulness, compression_ratios
+
+
+def _phase4_steering_alpha_grid(config, alpha_star_value):
+    """Positive alphas to evaluate in Phase 4 sweep, always including optimized alpha*."""
+    sweep = getattr(config, "phase4_alpha_sweep", None)
+    if sweep is None:
+        sweep = [a for a in config.alpha_sweep if a > 0]
+    alphas = {float(a) for a in sweep}
+    alphas.add(float(alpha_star_value))
+    return sorted(alphas)
+
+
+def _format_alpha_label(alpha, alpha_star_value):
+    if math.isclose(alpha, alpha_star_value, rel_tol=0.0, abs_tol=1e-5):
+        return f"{alpha:.4f} (α* optimized)"
+    s = f"{alpha:.4f}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
 
 def _load_alpha_star_v2(config, run_dir):
@@ -484,7 +502,7 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
         config,
         steering_vector=random_vector,
         alpha=alpha_value,
-        desc=f"Random noise alpha={alpha_value:.4f}",
+        desc=f"Random noise α={alpha_value:.4f}",
     )
     truth_steered = _evaluate_ccot_v2(
         coconut_model,
@@ -493,31 +511,39 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
         config,
         steering_vector=truth_vector,
         alpha=alpha_value,
-        desc=f"Truth vector alpha={alpha_value:.4f}",
+        desc=f"Truth vector α={alpha_value:.4f}",
     )
 
     ccot_correctness = ccot[0]
+    alpha_lbl = _format_alpha_label(alpha_value, alpha_value)
     rows = [
         _summarize_condition_v2("no_cot", "No CoT", *no_cot),
         _summarize_condition_v2("text_cot", "Text CoT", *text_cot),
         _summarize_condition_v2("ccot", "CCoT (baseline, alpha=0)", *ccot),
         _summarize_condition_v2(
             "random",
-            "CCoT + Random Noise",
+            f"CCoT + Random Noise (α={alpha_lbl})",
             *random_noise,
             baseline_correctness=ccot_correctness,
         ),
         _summarize_condition_v2(
             "truth",
-            "CCoT + Truth Vector",
+            f"CCoT + Truth Vector (α={alpha_lbl})",
             *truth_steered,
             baseline_correctness=ccot_correctness,
         ),
     ]
+    for row in rows:
+        row.setdefault("alpha", None)
+        row.setdefault("steering", None)
+    rows[3]["alpha"] = alpha_value
+    rows[3]["steering"] = "random"
+    rows[4]["alpha"] = alpha_value
+    rows[4]["steering"] = "truth"
     results_by_key = {row["key"]: row for row in rows}
 
     log("=" * 96)
-    log("FINAL COMPARISON TABLE")
+    log("FINAL COMPARISON TABLE (protocol summary @ optimized α*)")
     log("=" * 96)
     log(
         f"{'Condition':<30} | {'Accuracy':>8} | {'Flip':>8} | "
@@ -532,6 +558,84 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
             f"{row['latency']:.3f}s"
         )
 
+    sweep_truth_rows = []
+    sweep_random_rows = []
+    if getattr(config, "phase4_run_alpha_sweep", True):
+        grid = _phase4_steering_alpha_grid(config, alpha_value)
+        sweep_random = getattr(config, "phase4_sweep_random", True)
+        cached_truth = {}
+        cached_random = {}
+        for a in grid:
+            a = float(a)
+            if math.isclose(a, alpha_value, rel_tol=0.0, abs_tol=1e-5):
+                cached_truth[a] = truth_steered
+                cached_random[a] = random_noise
+        log("")
+        log("=" * 96)
+        log("STEERING SWEEP ON LOCKED TEST (multiple α; α* row = Phase 3 optimum)")
+        log("=" * 96)
+        log(
+            f"{'Steering':<14} | {'α':>14} | {'Accuracy':>8} | {'Flip':>8} | "
+            f"{'Tokens':>8} | {'Comp.R':>7} | {'Faith':>7} | {'Latency'}"
+        )
+        log("-" * 96)
+        for a in grid:
+            a = float(a)
+            alpha_disp = _format_alpha_label(a, alpha_value)
+            truth_a = cached_truth.get(a)
+            if truth_a is None:
+                truth_a = _evaluate_ccot_v2(
+                    coconut_model,
+                    test_data,
+                    tokenizer,
+                    config,
+                    steering_vector=truth_vector,
+                    alpha=a,
+                    desc=f"Truth sweep α={alpha_disp}",
+                )
+            t_row = _summarize_condition_v2(
+                f"truth_a_{a}",
+                f"Truth ({alpha_disp})",
+                *truth_a,
+                baseline_correctness=ccot_correctness,
+            )
+            t_row["alpha"] = a
+            t_row["steering"] = "truth"
+            sweep_truth_rows.append(t_row)
+            log(
+                f"{'Truth vector':<14} | {alpha_disp:>14} | {t_row['accuracy']:>7.2%} | "
+                f"{t_row['flip_rate']:>7.2%} | {t_row['token_count']:>8.1f} | "
+                f"{t_row['compression_ratio']:>7.3f} | {t_row['trajectory_faithfulness']:>7.4f} | "
+                f"{t_row['latency']:.3f}s"
+            )
+            if sweep_random:
+                rand_a = cached_random.get(a)
+                if rand_a is None:
+                    rand_a = _evaluate_ccot_v2(
+                        coconut_model,
+                        test_data,
+                        tokenizer,
+                        config,
+                        steering_vector=random_vector,
+                        alpha=a,
+                        desc=f"Random sweep α={alpha_disp}",
+                    )
+                r_row = _summarize_condition_v2(
+                    f"random_a_{a}",
+                    f"Random ({alpha_disp})",
+                    *rand_a,
+                    baseline_correctness=ccot_correctness,
+                )
+                r_row["alpha"] = a
+                r_row["steering"] = "random"
+                sweep_random_rows.append(r_row)
+                log(
+                    f"{'Random noise':<14} | {alpha_disp:>14} | {r_row['accuracy']:>7.2%} | "
+                    f"{r_row['flip_rate']:>7.2%} | {r_row['token_count']:>8.1f} | "
+                    f"{r_row['compression_ratio']:>7.3f} | {r_row['trajectory_faithfulness']:>7.4f} | "
+                    f"{r_row['latency']:.3f}s"
+                )
+
     log_dir = os.path.join(run_dir, "logs") if run_dir else config.save_path
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "phase4_evaluation.log")
@@ -542,11 +646,17 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
     results_dir = os.path.join(run_dir, "results") if run_dir else config.save_path
     os.makedirs(results_dir, exist_ok=True)
     metrics_path = os.path.join(results_dir, "metrics.json")
+    metrics_payload = {
+        "alpha_star": alpha_value,
+        "phase4_alpha_sweep_grid": _phase4_steering_alpha_grid(config, alpha_value)
+        if getattr(config, "phase4_run_alpha_sweep", True)
+        else [],
+        "conditions": rows,
+        "alpha_sweep_truth": sweep_truth_rows,
+        "alpha_sweep_random": sweep_random_rows,
+    }
     with open(metrics_path, "w") as f:
-        json.dump({
-            "alpha_star": alpha_value,
-            "conditions": rows,
-        }, f, indent=2)
+        json.dump(metrics_payload, f, indent=2)
     print(f"[LOG] Metrics saved to {metrics_path}")
 
-    return rows, results_by_key
+    return rows, results_by_key, sweep_truth_rows, sweep_random_rows

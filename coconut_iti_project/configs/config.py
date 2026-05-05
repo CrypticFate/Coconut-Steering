@@ -37,7 +37,8 @@ class Config:
         self.phase1_train_fraction = 0.9
 
         # Phase 2: frozen stochastic extraction from D_steer.
-        self.num_generations_per_sample = 10
+        # More samples per question → more contrastive (H⁺/H⁻) paths when Phase 1 is weak.
+        self.num_generations_per_sample = 20
         self.vector_extraction_temperature = 1.0
         self.min_vector_class_count = 100
         self.skip_non_contrastive_questions = True
@@ -58,8 +59,8 @@ class Config:
         self.lambda_mag = 0.01
         self.gradient_check_epsilon = 1e-2
         self.gradient_check_max_rel_error = 0.05
-        # For tiny test splits, finite-difference checks can be noisy.
-        self.enforce_gradient_check = False
+        # Failed check means α gradients are wrong; tuning must not continue silently.
+        self.enforce_gradient_check = True
         self.alpha_sweep = [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
         self.alpha_decay = 1.0
         self.alpha_star_path = None
@@ -68,6 +69,11 @@ class Config:
 
         # Phase 4: final locked-test evaluation.
         self.test_pool_size = 100
+        # After the main 5-condition table, also run CCoT+truth (and optionally +random)
+        # across these alphas, always merging in the learned alpha* from Phase 3.
+        self.phase4_run_alpha_sweep = True
+        self.phase4_alpha_sweep = None  # None -> use every alpha in alpha_sweep with alpha > 0
+        self.phase4_sweep_random = False  # If True, also sweep random noise at each α (2× cost)
         self.random_noise_seed = 1234
         self.max_new_tokens_no_cot = 32
         self.max_new_tokens_text_cot = 128
@@ -88,3 +94,4 @@ def set_seed(seed_value=42):
 
 set_seed(configs.seed)
 os.makedirs(configs.save_path, exist_ok=True)
+os.makedirs(os.path.join(configs.save_path, "log"), exist_ok=True)

@@ -89,32 +89,39 @@ class TeeLogger:
 
 
 def setup_run_directory(base_save_path):
-    """Create a timestamped run directory inside the base save path.
+    """Create a timestamped run directory under ``<base_save_path>/log/``.
+
+    All pipeline logs, plots, metrics JSON, and checkpoints for the run live here.
 
     Directory layout:
         base_save_path/
-            run_20260430_154300/
-                logs/
-                    pipeline_full.log   (master stdout + stderr)
-                    training_loss.csv   (per-epoch loss)
-                    extraction.log      (Phase 2 stats)
-                    phase4_evaluation.log
-                plots/
-                    loss_curve.png
-                    pca_latents.html
-                checkpoints/
-                    coconut_phase1.pt
-                    truth_vector.pt
-                    stage_N_epoch_M.pt  (per-stage snapshots)
-                config_snapshot.json
-                phase1_log.txt
-                phase2_log.txt
-                ...
+            log/
+                run_20260430_154300/
+                    logs/
+                        pipeline_full.log
+                        training_loss.csv
+                        extraction.log
+                        phase4_evaluation.log
+                        phase0_log.txt … phase4_log.txt
+                        config_snapshot.json
+                        alpha_tuning.json, truth_vector_metadata.json, …
+                    plots/
+                        loss_curve.png
+                        pca_latents.html
+                    checkpoints/
+                        coconut_phase1.pt
+                        truth_vector.pt
+                        alpha_star.pt
+                        stage_N_epoch_M.pt
+                    results/
+                        metrics.json
 
-    Returns the absolute path to the run directory.
+    Returns the absolute path to the run directory (inside ``log/``).
     """
+    log_root = os.path.join(base_save_path, "log")
+    os.makedirs(log_root, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(base_save_path, f"run_{timestamp}")
+    run_dir = os.path.join(log_root, f"run_{timestamp}")
 
     subdirs = ["logs", "plots", "checkpoints", "results"]
     for subdir in subdirs:
@@ -158,16 +165,19 @@ def save_config_snapshot(run_dir, config):
             val = str(val)
         snapshot[attr] = val
 
-    path = os.path.join(run_dir, "config_snapshot.json")
+    log_dir = os.path.join(run_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, "config_snapshot.json")
     with open(path, "w") as f:
         json.dump(snapshot, f, indent=2, default=str)
     print(f"[LOG] Config snapshot saved to {path}")
 
 
 def save_phase_log(save_path, phase_num, phase_name, content):
-    """Write a log file for a completed phase to the checkpoints directory."""
-    os.makedirs(save_path, exist_ok=True)
-    log_file = os.path.join(save_path, f"phase{phase_num}_log.txt")
+    """Write a phase summary under ``<run_dir>/logs/phase{N}_log.txt``."""
+    log_dir = os.path.join(save_path, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"phase{phase_num}_log.txt")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(log_file, "w") as f:
         f.write(f"Phase {phase_num}: {phase_name}\n")
