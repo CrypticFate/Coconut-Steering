@@ -10,6 +10,14 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from utils.helpers import answers_match, extract_final_answer
+from utils.visualizer import (
+    plot_alignment_coherence,
+    plot_alpha_sweep_test,
+    plot_efficiency,
+    plot_flip_examples,
+    plot_flip_rate,
+    plot_main_comparison,
+)
 
 
 def _extract_answer(output_text):
@@ -333,7 +341,8 @@ def _compression_ratio_v2(sample, tokenizer, compressed_tokens):
 
 
 def _summarize_condition_v2(key, label, correctness, token_counts, latencies,
-                            faithfulness, compression_ratios, baseline_correctness=None):
+                            coherence_scores, alignment_scores, compression_ratios,
+                            baseline_correctness=None):
     total = len(correctness)
     correct = sum(correctness)
     baseline_errors = 0
@@ -352,7 +361,8 @@ def _summarize_condition_v2(key, label, correctness, token_counts, latencies,
         "flip_rate": flips / baseline_errors if baseline_errors else 0.0,
         "token_count": float(np.mean(token_counts)) if token_counts else 0.0,
         "latency": float(np.mean(latencies)) if latencies else 0.0,
-        "trajectory_faithfulness": float(np.mean(faithfulness)) if faithfulness else 0.0,
+        "trajectory_coherence": float(np.mean(coherence_scores)) if coherence_scores else 0.0,
+        "truth_alignment": float(np.mean(alignment_scores)) if alignment_scores else 0.0,
         "compression_ratio": float(np.mean(compression_ratios)) if compression_ratios else 0.0,
         "correct": correct,
         "total": total,
@@ -360,7 +370,7 @@ def _summarize_condition_v2(key, label, correctness, token_counts, latencies,
 
 
 def _evaluate_direct_v2(base_model, test_data, tokenizer, config, mode):
-    correctness, token_counts, latencies, faithfulness, compression_ratios = [], [], [], [], []
+    correctness, token_counts, latencies, coherence, alignment, compression_ratios = [], [], [], [], [], []
     if mode == "no_cot":
         desc = "No CoT"
         max_new_tokens = config.max_new_tokens_no_cot
@@ -391,24 +401,30 @@ def _evaluate_direct_v2(base_model, test_data, tokenizer, config, mode):
         generated_tokens = out_ids.shape[1] - input_ids.shape[1]
         token_counts.append(float(generated_tokens if reasoning_tokens is None else reasoning_tokens))
         compression_ratios.append(ratio)
-        faithfulness.append(0.0)
+        coherence.append(0.0)
+        alignment.append(0.0)
         predicted = extract_final_answer(tokenizer.decode(out_ids[0], skip_special_tokens=True))
         correctness.append(answers_match(predicted, sample["answer"]))
 
-    return correctness, token_counts, latencies, faithfulness, compression_ratios
+    return correctness, token_counts, latencies, coherence, alignment, compression_ratios
 
 
 def _evaluate_ccot_v2(coconut_model, test_data, tokenizer, config, steering_vector=None,
-                      alpha=0.0, desc="CCoT", steering_mode="vector"):
-    correctness, token_counts, latencies, faithfulness, compression_ratios = [], [], [], [], []
+                      alpha=0.0, desc="CCoT", steering_mode="vector", truth_reference=None,
+                      include_details=False):
+    correctness, token_counts, latencies, coherence, alignment, compression_ratios = [], [], [], [], [], []
     n_latents = config.max_latent_tokens
+    truth_ref_cpu = None
+    if truth_reference is not None:
+        truth_ref_cpu = F.normalize(truth_reference.detach().cpu().float(), p=2, dim=-1)
 
+    details = []
     for sample in tqdm(test_data, desc=desc):
         prompt = _latent_prompt_v2(sample, n_latents)
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(config.device)
         start = time.perf_counter()
         with torch.no_grad():
-            gen_ids, _, faith_score = coconut_model.generate_with_latents(
+            gen_ids, mean_latent, coherence_score = coconut_model.generate_with_latents(
                 input_ids,
                 max_new_tokens=config.max_new_tokens_ccot,
                 temperature=0.0,
@@ -420,11 +436,31 @@ def _evaluate_ccot_v2(coconut_model, test_data, tokenizer, config, steering_vect
         latencies.append(time.perf_counter() - start)
         token_counts.append(float(n_latents))
         compression_ratios.append(_compression_ratio_v2(sample, tokenizer, n_latents))
-        faithfulness.append(float(faith_score))
+        coherence.append(float(coherence_score))
+        if mean_latent is not None and truth_ref_cpu is not None:
+            align = F.cosine_similarity(
+                F.normalize(mean_latent.float(), p=2, dim=-1),
+                truth_ref_cpu,
+                dim=-1,
+            ).mean().item()
+        else:
+            align = 0.0
+        alignment.append(float(align))
         predicted = extract_final_answer(tokenizer.decode(gen_ids[0], skip_special_tokens=True))
-        correctness.append(answers_match(predicted, sample["answer"]))
+        is_ok = answers_match(predicted, sample["answer"])
+        correctness.append(is_ok)
+        if include_details:
+            details.append({
+                "qid": sample.get("qid"),
+                "question": sample["question"],
+                "gold": sample["answer"],
+                "pred": predicted,
+                "correct": bool(is_ok),
+            })
 
-    return correctness, token_counts, latencies, faithfulness, compression_ratios
+    if include_details:
+        return correctness, token_counts, latencies, coherence, alignment, compression_ratios, details
+    return correctness, token_counts, latencies, coherence, alignment, compression_ratios
 
 
 def _phase4_steering_alpha_grid(config, alpha_star_value):
@@ -442,6 +478,12 @@ def _format_alpha_label(alpha, alpha_star_value):
         return f"{alpha:.4f} (α* optimized)"
     s = f"{alpha:.4f}".rstrip("0").rstrip(".")
     return s if s else "0"
+
+
+def _format_alpha_sweep_cell(alpha, alpha_star_value):
+    if math.isclose(alpha, alpha_star_value, rel_tol=0.0, abs_tol=1e-5):
+        return f"{alpha:.4f} (best α*)"
+    return _format_alpha_label(alpha, alpha_star_value)
 
 
 def _load_alpha_star_v2(config, run_dir):
@@ -480,11 +522,15 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
 
     log("Starting Phase 4: Locked-Test Evaluation...")
     log(f"Using learned alpha*: {alpha_value:.4f}")
+    log("Note: Phase 4 tables are on the locked test set; validation alpha sweep lives in Phase 3 outputs.")
     log("")
 
     no_cot = _evaluate_direct_v2(base_model, test_data, tokenizer, config, mode="no_cot")
     text_cot = _evaluate_direct_v2(base_model, test_data, tokenizer, config, mode="text_cot")
-    ccot = _evaluate_ccot_v2(coconut_model, test_data, tokenizer, config, desc="CCoT baseline")
+    ccot = _evaluate_ccot_v2(
+        coconut_model, test_data, tokenizer, config, desc="CCoT baseline", truth_reference=truth_vector,
+        include_details=True,
+    )
 
     generator = torch.Generator(device=config.device).manual_seed(config.random_noise_seed)
     random_vector = torch.randn(
@@ -503,6 +549,8 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
         steering_vector=random_vector,
         alpha=alpha_value,
         desc=f"Random noise α={alpha_value:.4f}",
+        truth_reference=truth_vector,
+        include_details=True,
     )
     truth_steered = _evaluate_ccot_v2(
         coconut_model,
@@ -512,24 +560,29 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
         steering_vector=truth_vector,
         alpha=alpha_value,
         desc=f"Truth vector α={alpha_value:.4f}",
+        truth_reference=truth_vector,
+        include_details=True,
     )
 
     ccot_correctness = ccot[0]
+    ccot_details = ccot[-1]
+    random_details = random_noise[-1]
+    truth_details = truth_steered[-1]
     alpha_lbl = _format_alpha_label(alpha_value, alpha_value)
     rows = [
         _summarize_condition_v2("no_cot", "No CoT", *no_cot),
         _summarize_condition_v2("text_cot", "Text CoT", *text_cot),
-        _summarize_condition_v2("ccot", "CCoT (baseline, alpha=0)", *ccot),
+        _summarize_condition_v2("ccot", "CCoT (baseline, alpha=0)", *ccot[:-1]),
         _summarize_condition_v2(
             "random",
             f"CCoT + Random Noise (α={alpha_lbl})",
-            *random_noise,
+            *random_noise[:-1],
             baseline_correctness=ccot_correctness,
         ),
         _summarize_condition_v2(
             "truth",
             f"CCoT + Truth Vector (α={alpha_lbl})",
-            *truth_steered,
+            *truth_steered[:-1],
             baseline_correctness=ccot_correctness,
         ),
     ]
@@ -542,26 +595,10 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
     rows[4]["steering"] = "truth"
     results_by_key = {row["key"]: row for row in rows}
 
-    log("=" * 96)
-    log("FINAL COMPARISON TABLE (protocol summary @ optimized α*)")
-    log("=" * 96)
-    log(
-        f"{'Condition':<30} | {'Accuracy':>8} | {'Flip':>8} | "
-        f"{'Tokens':>8} | {'Comp.R':>7} | {'Faith':>7} | {'Latency'}"
-    )
-    log("-" * 96)
-    for row in rows:
-        log(
-            f"{row['condition']:<30} | {row['accuracy']:>7.2%} | "
-            f"{row['flip_rate']:>7.2%} | {row['token_count']:>8.1f} | "
-            f"{row['compression_ratio']:>7.3f} | {row['trajectory_faithfulness']:>7.4f} | "
-            f"{row['latency']:.3f}s"
-        )
-
     sweep_truth_rows = []
     sweep_random_rows = []
+    grid = _phase4_steering_alpha_grid(config, alpha_value) if getattr(config, "phase4_run_alpha_sweep", True) else []
     if getattr(config, "phase4_run_alpha_sweep", True):
-        grid = _phase4_steering_alpha_grid(config, alpha_value)
         sweep_random = getattr(config, "phase4_sweep_random", True)
         cached_truth = {}
         cached_random = {}
@@ -576,7 +613,7 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
         log("=" * 96)
         log(
             f"{'Steering':<14} | {'α':>14} | {'Accuracy':>8} | {'Flip':>8} | "
-            f"{'Tokens':>8} | {'Comp.R':>7} | {'Faith':>7} | {'Latency'}"
+            f"{'Tokens':>8} | {'Comp.R':>7} | {'Coh.':>7} | {'Align':>7} | {'Latency'}"
         )
         log("-" * 96)
         for a in grid:
@@ -592,6 +629,7 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
                     steering_vector=truth_vector,
                     alpha=a,
                     desc=f"Truth sweep α={alpha_disp}",
+                    truth_reference=truth_vector,
                 )
             t_row = _summarize_condition_v2(
                 f"truth_a_{a}",
@@ -605,7 +643,8 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
             log(
                 f"{'Truth vector':<14} | {alpha_disp:>14} | {t_row['accuracy']:>7.2%} | "
                 f"{t_row['flip_rate']:>7.2%} | {t_row['token_count']:>8.1f} | "
-                f"{t_row['compression_ratio']:>7.3f} | {t_row['trajectory_faithfulness']:>7.4f} | "
+                f"{t_row['compression_ratio']:>7.3f} | {t_row['trajectory_coherence']:>7.4f} | "
+                f"{t_row['truth_alignment']:>7.4f} | "
                 f"{t_row['latency']:.3f}s"
             )
             if sweep_random:
@@ -619,6 +658,7 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
                         steering_vector=random_vector,
                         alpha=a,
                         desc=f"Random sweep α={alpha_disp}",
+                        truth_reference=truth_vector,
                     )
                 r_row = _summarize_condition_v2(
                     f"random_a_{a}",
@@ -632,9 +672,45 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
                 log(
                     f"{'Random noise':<14} | {alpha_disp:>14} | {r_row['accuracy']:>7.2%} | "
                     f"{r_row['flip_rate']:>7.2%} | {r_row['token_count']:>8.1f} | "
-                    f"{r_row['compression_ratio']:>7.3f} | {r_row['trajectory_faithfulness']:>7.4f} | "
+                    f"{r_row['compression_ratio']:>7.3f} | {r_row['trajectory_coherence']:>7.4f} | "
+                    f"{r_row['truth_alignment']:>7.4f} | "
                     f"{r_row['latency']:.3f}s"
                 )
+
+    # Table 1: compact alpha sweep (truth vector), includes best α* explicitly.
+    if sweep_truth_rows:
+        log("")
+        log("=" * 96)
+        log("ALPHA SWEEP TABLE (Truth Vector on locked test; includes best α*)")
+        log("=" * 96)
+        log(f"{'Alpha':<22} | {'Accuracy':>9} | {'Flip Rate':>10} | {'Faithfulness'}")
+        log("-" * 96)
+        for row in sweep_truth_rows:
+            a_cell = _format_alpha_sweep_cell(row["alpha"], alpha_value)
+            log(
+                f"{a_cell:<22} | {row['accuracy']:>8.2%} | {row['flip_rate']:>9.2%} | "
+                f"{row['trajectory_coherence']:.4f}"
+            )
+
+    # Table 2: final protocol comparison at best α*.
+    log("")
+    log("=" * 96)
+    log(f"FINAL COMPARISON TABLE (best α*={alpha_value:.4f} used)")
+    log("Random-noise condition uses a random unit vector at best α*.")
+    log("=" * 96)
+    log(
+        f"{'Condition':<30} | {'Accuracy':>8} | {'Flip':>8} | "
+        f"{'Tokens':>8} | {'Comp.R':>7} | {'Coh.':>7} | {'Align':>7} | {'Latency'}"
+    )
+    log("-" * 96)
+    for row in rows:
+        log(
+            f"{row['condition']:<30} | {row['accuracy']:>7.2%} | "
+            f"{row['flip_rate']:>7.2%} | {row['token_count']:>8.1f} | "
+            f"{row['compression_ratio']:>7.3f} | {row['trajectory_coherence']:>7.4f} | "
+            f"{row['truth_alignment']:>7.4f} | "
+            f"{row['latency']:.3f}s"
+        )
 
     log_dir = os.path.join(run_dir, "logs") if run_dir else config.save_path
     os.makedirs(log_dir, exist_ok=True)
@@ -648,9 +724,7 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
     metrics_path = os.path.join(results_dir, "metrics.json")
     metrics_payload = {
         "alpha_star": alpha_value,
-        "phase4_alpha_sweep_grid": _phase4_steering_alpha_grid(config, alpha_value)
-        if getattr(config, "phase4_run_alpha_sweep", True)
-        else [],
+        "phase4_alpha_sweep_grid": grid,
         "conditions": rows,
         "alpha_sweep_truth": sweep_truth_rows,
         "alpha_sweep_random": sweep_random_rows,
@@ -658,5 +732,41 @@ def run_full_evaluation(coconut_model, test_data, tokenizer, config, truth_vecto
     with open(metrics_path, "w") as f:
         json.dump(metrics_payload, f, indent=2)
     print(f"[LOG] Metrics saved to {metrics_path}")
+
+    if run_dir:
+        phase4_plot_dir = os.path.join(run_dir, "plots", "phase4")
+        os.makedirs(phase4_plot_dir, exist_ok=True)
+        plot_main_comparison(rows, os.path.join(phase4_plot_dir, "main_comparison.png"))
+        plot_flip_rate(rows, os.path.join(phase4_plot_dir, "flip_rate.png"))
+        plot_alpha_sweep_test(
+            sweep_truth_rows,
+            sweep_random_rows,
+            baseline_acc=results_by_key["ccot"]["accuracy"],
+            alpha_star=alpha_value,
+            save_path=os.path.join(phase4_plot_dir, "alpha_sweep_test.png"),
+        )
+        plot_efficiency(rows, os.path.join(phase4_plot_dir, "accuracy_vs_tokens.png"))
+        plot_alignment_coherence(rows, os.path.join(phase4_plot_dir, "alignment_vs_coherence.png"))
+        flip_examples = []
+        random_by_qid = {d.get("qid"): d for d in random_details}
+        truth_by_qid = {d.get("qid"): d for d in truth_details}
+        for base in ccot_details:
+            qid = base.get("qid")
+            r = random_by_qid.get(qid)
+            t = truth_by_qid.get(qid)
+            if not r or not t:
+                continue
+            if (not base["correct"]) and t["correct"]:
+                flip_examples.append({
+                    "qid": qid,
+                    "question": base["question"],
+                    "gold": base["gold"],
+                    "base_pred": base["pred"],
+                    "random_pred": r["pred"],
+                    "truth_pred": t["pred"],
+                    "fixed_by_random": bool(r["correct"]),
+                })
+        flip_examples.sort(key=lambda x: (not x["fixed_by_random"], x["qid"] or ""))
+        plot_flip_examples(flip_examples, os.path.join(phase4_plot_dir, "flip_examples.png"))
 
     return rows, results_by_key, sweep_truth_rows, sweep_random_rows

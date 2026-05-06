@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 
 from data.data_loader import get_hf_dataset
 from utils.helpers import clear_memory
+from utils.visualizer import plot_embedding_drift, plot_stage_losses, plot_val_accuracy
 
 
 def get_stage_info(epoch):
@@ -130,10 +131,42 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
 
     collator = MyCollator(tokenizer, latent_id=latent_id)
     ds_phase1 = get_hf_dataset(data_phase1, tokenizer)
+    n_val = max(1, int(round(len(data_phase1) * 0.1))) if len(data_phase1) > 1 else 0
+    data_phase1_train = data_phase1[:-n_val] if n_val else data_phase1
+    data_phase1_val = data_phase1[-n_val:] if n_val else []
+    ds_phase1 = get_hf_dataset(data_phase1_train, tokenizer)
 
     optimizer = None
     scheduler = None
     loss_history = []
+    losses_per_stage = {i: [] for i in range(5)}
+    stage_transition_epochs = []
+    drift_by_token = {"<|start-latent|>": [], "<|latent|>": [], "<|end-latent|>": []}
+    input_embeds_ref = coconut_model.base_causallm.get_input_embeddings().weight.detach().clone()
+    val_acc_history = []
+
+    def _phase1_val_accuracy():
+        if not data_phase1_val:
+            return 0.0
+        coconut_model.eval()
+        correct = 0
+        for sample in data_phase1_val:
+            prompt = (
+                sample["question"] + "\n<|start-latent|>"
+                + "<|latent|>" * config.max_latent_tokens + "<|end-latent|>"
+            )
+            inp = tokenizer.encode(prompt, return_tensors="pt").to(config.device)
+            with torch.no_grad():
+                out_ids, _, _ = coconut_model.generate_with_latents(
+                    inp,
+                    max_new_tokens=config.max_new_tokens_ccot,
+                    temperature=0.0,
+                )
+            pred = sample["answer"].replace(",", "").strip()
+            decoded = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+            if pred in decoded.replace(",", ""):
+                correct += 1
+        return correct / max(len(data_phase1_val), 1)
 
     print("Starting FULL PARAMETER COCONUT Training (Qwen 1.5B Math)...")
     for epoch in range(config.num_epochs_total):
@@ -148,6 +181,7 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
         )
 
         if requires_reset or optimizer is None:
+            stage_transition_epochs.append(epoch)
             print(f"\n[Epoch {epoch}] Stage shifted to {current_stage}. "
                   f"Hard resetting Native 32-bit AdamW Optimizer & Scheduler...")
             
@@ -203,6 +237,22 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
 
         epoch_avg_loss = total_loss / max(len(train_loader), 1)
         loss_history.append(epoch_avg_loss)
+        losses_per_stage[current_stage].append(epoch_avg_loss)
+        with torch.no_grad():
+            w = coconut_model.base_causallm.get_input_embeddings().weight.detach()
+            tok_map = {
+                "<|start-latent|>": start_id,
+                "<|latent|>": latent_id,
+                "<|end-latent|>": end_id,
+            }
+            for name, tid in tok_map.items():
+                drift = torch.nn.functional.cosine_similarity(
+                    w[tid].float().unsqueeze(0),
+                    input_embeds_ref[tid].float().unsqueeze(0),
+                    dim=-1,
+                ).item()
+                drift_by_token[name].append(drift)
+        val_acc_history.append(_phase1_val_accuracy())
 
     ckpt_dir = os.path.join(run_dir, "checkpoints") if run_dir else config.save_path
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -210,5 +260,32 @@ def train_phase1(coconut_model, data_phase1, tokenizer, config, latent_id, start
     torch.save(coconut_model.state_dict(), checkpoint_path)
     print(f"Phase 1 checkpoint saved to {checkpoint_path}")
 
+    if run_dir:
+        phase1_plot_dir = os.path.join(run_dir, "plots", "phase1")
+        os.makedirs(phase1_plot_dir, exist_ok=True)
+        plot_stage_losses(
+            losses_per_stage,
+            stage_transition_epochs=sorted(set(stage_transition_epochs)),
+            save_path=os.path.join(phase1_plot_dir, "stage_loss_curve.png"),
+        )
+        plot_embedding_drift(
+            drift_by_token,
+            save_path=os.path.join(phase1_plot_dir, "embedding_drift.png"),
+        )
+        if data_phase1_val:
+            best_epoch = int(torch.tensor(val_acc_history).argmax().item())
+            plot_val_accuracy(
+                val_acc_history,
+                best_epoch=best_epoch,
+                best_acc=val_acc_history[best_epoch],
+                save_path=os.path.join(phase1_plot_dir, "val_accuracy.png"),
+            )
+
     clear_memory()
-    return loss_history
+    return {
+        "loss_history": loss_history,
+        "losses_per_stage": losses_per_stage,
+        "stage_transition_epochs": sorted(set(stage_transition_epochs)),
+        "embedding_drift": drift_by_token,
+        "val_accuracy": val_acc_history,
+    }

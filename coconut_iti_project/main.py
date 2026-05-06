@@ -23,7 +23,12 @@ from utils.helpers import (
     clear_memory, save_phase_log, save_config_snapshot,
     setup_run_directory, activate_logging, deactivate_logging,
 )
-from utils.visualizer import plot_loss_curve, plot_latent_pca
+from utils.visualizer import (
+    plot_decoded_latents,
+    plot_latent_pca,
+    plot_loss_curve,
+    plot_pipeline_summary,
+)
 
 
 def log_phase(phase_num, phase_name):
@@ -85,7 +90,7 @@ def main():
     print("\n" + "-" * 60)
     print("  Loading Datasets")
     print("-" * 60)
-    data_phase1, data_phase2, data_val, test_data = prepare_datasets(config, include_val=True)
+    data_phase1, data_phase1_val, data_phase2, data_val, test_data = prepare_datasets(config, include_val=True)
 
     # --- Model ---
     print("\n" + "-" * 60)
@@ -100,15 +105,43 @@ def main():
 
     if not args.skip_phase1:
         phase1_start = time.time()
-        loss_history = train_phase1(
+        phase1_artifacts = train_phase1(
             coconut_model, data_phase1, tokenizer, config, latent_id, start_id, end_id,
             run_dir=run_dir,
         )
+        loss_history = phase1_artifacts["loss_history"]
         phase1_time = time.time() - phase1_start
         print(f"\nPhase 1 completed in {phase1_time / 60:.1f} minutes")
         print(f"Final training loss: {loss_history[-1]:.4f}")
 
-        plot_loss_curve(loss_history, os.path.join(plots_dir, "loss_curve.png"))
+        plot_loss_curve(loss_history, os.path.join(plots_dir, "phase1", "loss_curve.png"))
+        # P1-D decoded latent interpretations
+        decoded_examples = []
+        for sample in test_data[:5]:
+            prompt = (
+                sample["question"] + "\n<|start-latent|>"
+                + "<|latent|>" * config.max_latent_tokens + "<|end-latent|>"
+            )
+            input_ids = tokenizer.encode(prompt, return_tensors="pt").to(config.device)
+            with torch.no_grad():
+                _generated_ids, _, _ = coconut_model.generate_with_latents(
+                    input_ids,
+                    max_new_tokens=config.max_new_tokens_ccot,
+                    temperature=0.0,
+                )
+                lm_head = coconut_model.base_causallm.lm_head
+                steps = []
+                for t, h in enumerate(coconut_model.last_generation_latents):
+                    logits = lm_head(h.to(config.device))
+                    probs = torch.softmax(logits, dim=-1)[0]
+                    topv, topi = torch.topk(probs, k=3)
+                    top3 = []
+                    for p, idx in zip(topv.tolist(), topi.tolist()):
+                        tok = tokenizer.decode([idx]).strip().replace("\n", " ")
+                        top3.append((tok if tok else f"<id:{idx}>", p))
+                    steps.append({"t": t, "top3": top3})
+            decoded_examples.append({"question": sample["question"], "steps": steps})
+        plot_decoded_latents(decoded_examples, os.path.join(plots_dir, "phase1", "decoded_latents.png"))
         print_sample_outputs(coconut_model, tokenizer, test_data, config, phase_name="PHASE 1 (BASE)")
 
         save_phase_log(run_dir, 1, "SILENT THINKING (Full Parameter COCONUT Training)", (
@@ -153,7 +186,7 @@ def main():
         phase2_time = time.time() - phase2_start
         print(f"\nPhase 2 completed in {phase2_time / 60:.1f} minutes")
 
-        plot_latent_pca(correct_latents, wrong_latents, os.path.join(plots_dir, "pca_latents.html"))
+        plot_latent_pca(correct_latents, wrong_latents, os.path.join(plots_dir, "phase2", "pca_latents.html"))
 
         save_phase_log(run_dir, 2, "MIND READING (Global Truth Vector Extraction)", (
             f"Extraction Samples: {len(data_phase2)}\n"
@@ -199,7 +232,9 @@ def main():
             f"Validation Samples: {len(data_val)}\n"
             f"Alpha*: {float(alpha_star.detach().cpu()):.6f}\n"
             f"Alpha Max: {config.alpha_max}\n"
+            "Sigma definition: σ = h.std(dim=-1, keepdim=True) across hidden units (Li et al. 2023 ITI)\n"
             f"Alpha Decay (gamma): {config.alpha_decay}\n"
+            "Gamma note: default γ=0.95 (configurable); report γ=1.0 ablation separately.\n"
             f"Lambda Align: {config.lambda_align}\n"
             f"Lambda Mag: {config.lambda_mag}\n"
             f"Best D_val_es Accuracy: {alpha_metadata.get('best_early_stop_accuracy')}\n"
@@ -242,6 +277,9 @@ def main():
         f"Test Samples: {len(test_data)}\n",
         f"Alpha*: {float(alpha_star.detach().cpu()):.6f}\n",
         f"Alpha Decay (gamma): {config.alpha_decay}\n",
+        "Evaluation split note: This Phase 4 report is locked-test only. "
+        "Validation alpha sweeps are logged in Phase 3 (alpha_tuning.json).\n",
+        "Compression Ratio definition: num_latent_tokens / mean_text_cot_token_count.\n",
         f"Duration: {phase4_time / 60:.1f} minutes\n\n",
         "--- FINAL CONDITIONS ---\n",
         f"{'Condition':<30} | {'Accuracy':<10} | {'Flip Rate':<10} | {'Tokens':<8} | {'Latency'}\n",
@@ -290,6 +328,22 @@ def main():
     print(f"  Checkpoints:  {ckpt_dir}/")
     print(f"  Plots:        {plots_dir}/")
     print(f"  Logs & JSON: {os.path.join(run_dir, 'logs')}/")
+
+    # Cross-phase summary plot
+    by_key = {r["key"]: r for r in experiment_results}
+    stage_labels = [
+        "Phase1 COCONUT",
+        "Phase4 α=0",
+        "Phase4 α* Random",
+        "Phase4 α* Truth",
+    ]
+    stage_accs = [
+        by_key["ccot"]["accuracy"],
+        by_key["ccot"]["accuracy"],
+        by_key["random"]["accuracy"],
+        by_key["truth"]["accuracy"],
+    ]
+    plot_pipeline_summary(stage_labels, stage_accs, os.path.join(plots_dir, "pipeline_summary.png"))
 
     # Pipeline summary log
     save_phase_log(run_dir, 0, "PIPELINE SUMMARY", (

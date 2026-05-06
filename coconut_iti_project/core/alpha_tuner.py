@@ -9,6 +9,13 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from utils.helpers import answers_match, clear_memory, extract_final_answer, save_json_log
+from utils.visualizer import (
+    plot_alpha_convergence,
+    plot_alpha_sweep_val,
+    plot_gradient_check,
+    plot_loss_components,
+    plot_val_accuracy_tuning,
+)
 
 
 def _latent_prompt(sample, n_latents):
@@ -42,14 +49,12 @@ def _tokenize_for_alpha_tuning(sample, tokenizer, device):
 
 
 def _tuning_regularizers(h_steered_seq, truth_vector, alpha_scalar):
-    """Align + magnitude penalties at current α (``alpha_scalar`` may depend on ``theta``)."""
+    """Magnitude penalty at current α (align regularizer intentionally disabled)."""
     h_stack = torch.stack(h_steered_seq, dim=0)
     direction = F.normalize(truth_vector.float(), p=2, dim=-1)
     if direction.dim() == 2:
         direction = direction.squeeze(0)
-    align = -F.cosine_similarity(
-        h_stack.float(), direction.unsqueeze(0).expand_as(h_stack), dim=-1
-    ).mean()
+    align = h_stack.new_tensor(0.0)
     sig = h_stack.float().std(dim=-1, keepdim=True)
     a = alpha_scalar.float()
     perturb = a * sig * direction
@@ -164,8 +169,8 @@ def _evaluate_loss(coconut_model, dataset, tokenizer, config, truth_vector, alph
                     gamma=config.alpha_decay,
                     alpha_tensor=alpha_t,
                 )
-                align, mag = _tuning_regularizers(h_seq, truth_vector, alpha_t)
-                loss = L_ans.float() + config.lambda_align * align + config.lambda_mag * mag
+                _, mag = _tuning_regularizers(h_seq, truth_vector, alpha_t)
+                loss = L_ans.float() + config.lambda_mag * mag
         losses.append(float(loss.detach().cpu()))
     return sum(losses) / len(losses)
 
@@ -343,6 +348,8 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
     best_theta = theta.detach().clone()
     stale_epochs = 0
     training_log = []
+    val_es_acc_history = []
+    alpha_epoch_history = []
 
     for epoch in range(config.alpha_max_epochs):
         epoch_losses = []
@@ -363,10 +370,9 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
                     alpha_fn=alpha_fn,
                 )
                 alpha_now_step = _alpha_from_theta(theta, config.alpha_max)
-                align, mag = _tuning_regularizers(h_seq, truth_vector, alpha_now_step)
+                _, mag = _tuning_regularizers(h_seq, truth_vector, alpha_now_step)
                 loss = (
                     L_ans.float()
-                    + config.lambda_align * align
                     + config.lambda_mag * mag
                 )
 
@@ -379,7 +385,7 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
                 "epoch": epoch,
                 "loss": loss_value,
                 "answer_loss": float(L_ans.detach().cpu()),
-                "align_loss": float(align.detach().cpu()),
+                "align_loss": 0.0,
                 "mag_loss": float(mag.detach().cpu()),
                 "alpha": float(alpha_now_step.detach().cpu()),
             }
@@ -411,6 +417,8 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
             f"D_val_es_acc={es_accuracy:.2%} early_stop_loss={es_loss:.6f} "
             f"alpha={float(alpha_now.cpu()):.4f}"
         )
+        val_es_acc_history.append(float(es_accuracy))
+        alpha_epoch_history.append(float(alpha_now.cpu()))
 
         if es_accuracy > best_es_accuracy:
             best_es_accuracy = es_accuracy
@@ -433,6 +441,7 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
 
     diagnostic_sweep = []
     if getattr(config, "run_alpha_diagnostic_sweep", True):
+        print("Running validation-only alpha diagnostic sweep on D_val (analysis only).")
         diagnostic_sweep = run_alpha_diagnostic_sweep(
             coconut_model,
             data_val,
@@ -454,12 +463,47 @@ def tune_alpha(coconut_model, data_val, tokenizer, config, truth_vector, run_dir
         "best_early_stop_loss_at_best_acc": best_es_loss_at_acc,
         "gradient_check": gradient_check,
         "training_log": training_log,
+        "diagnostic_sweep_split": "validation",
         "diagnostic_sweep": diagnostic_sweep,
+        "val_es_acc_history": val_es_acc_history,
+        "alpha_epoch_history": alpha_epoch_history,
         "duration_s": time.time() - phase_start,
     }
 
     if run_dir:
         save_json_log(run_dir, "alpha_tuning.json", metadata)
+        phase3_plot_dir = os.path.join(run_dir, "plots", "phase3")
+        os.makedirs(phase3_plot_dir, exist_ok=True)
+        alpha_hist = [entry["alpha"] for entry in training_log]
+        ans_hist = [entry["answer_loss"] for entry in training_log]
+        mag_hist = [entry["mag_loss"] for entry in training_log]
+        total_hist = [entry["loss"] for entry in training_log]
+        plot_alpha_convergence(
+            alpha_hist,
+            float(alpha_star.detach().cpu()),
+            os.path.join(phase3_plot_dir, "alpha_convergence.png"),
+        )
+        plot_loss_components(
+            ans_hist, mag_hist, total_hist,
+            os.path.join(phase3_plot_dir, "loss_components.png"),
+        )
+        plot_val_accuracy_tuning(
+            val_es_acc_history,
+            os.path.join(phase3_plot_dir, "val_es_accuracy.png"),
+        )
+        if diagnostic_sweep:
+            plot_alpha_sweep_val(
+                [x["alpha"] for x in diagnostic_sweep],
+                [x["accuracy"] for x in diagnostic_sweep],
+                float(alpha_star.detach().cpu()),
+                os.path.join(phase3_plot_dir, "alpha_sweep_val.png"),
+            )
+        plot_gradient_check(
+            [gradient_check["analytic_grad"]],
+            [gradient_check["finite_difference_grad"]],
+            gradient_check["relative_error"],
+            os.path.join(phase3_plot_dir, "gradient_check.png"),
+        )
 
     for param, requires_grad in zip(coconut_model.parameters(), previous_trainable):
         param.requires_grad = requires_grad
