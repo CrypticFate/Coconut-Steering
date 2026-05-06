@@ -24,13 +24,13 @@ class Config:
         self.max_latent_tokens = 6         
         self.num_epochs_total = 50         
         
-        # Test-run protocol split on a 500-example train pool:
-        # - D_train = 300 (60%)
-        # - D_steer =  50 (10%)
-        # - D_val   = 150 (30%)
-        self.train_pool_size = 500
-        self.protocol_reserved_examples = 200  # D_steer + D_val
-        self.phase2_steer_examples = 50
+        # Full-run protocol split on a 7,473-example train pool:
+        # - D_train = 4,484 (60%)
+        # - D_steer =   747 (10%)
+        # - D_val   = 2,242 (30%)
+        self.train_pool_size = 7473
+        self.protocol_reserved_examples = 2989  # D_steer + D_val
+        self.phase2_steer_examples = 747
         # Internal split for D_train checkpoint selection:
         # - D_train-actual = 90%
         # - D_train-val    = 10%
@@ -71,7 +71,7 @@ class Config:
         self.run_alpha_diagnostic_sweep = True
 
         # Phase 4: final locked-test evaluation.
-        self.test_pool_size = 100
+        self.test_pool_size = 1319
         # After the main 5-condition table, also run CCoT+truth (and optionally +random)
         # across these alphas, always merging in the learned alpha* from Phase 3.
         self.phase4_run_alpha_sweep = True
