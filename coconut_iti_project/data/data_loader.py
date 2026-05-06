@@ -113,8 +113,8 @@ def prepare_datasets(config, include_val=False):
     - Phase 4 (Evaluation): All 1,319 examples from test.jsonl
 
     By default this preserves the historical 3-tuple return. Pass
-    include_val=True to get the v2 protocol split:
-        data_phase1, data_phase2, data_val, test_data
+    include_val=True to get the full protocol split:
+        data_phase1, data_phase1_val, data_phase2, data_val, test_data
     """
     print(f"Loading training data from {TRAIN_JSONL}...")
     raw_train = _load_jsonl(TRAIN_JSONL)
@@ -176,5 +176,5 @@ def prepare_datasets(config, include_val=False):
     print("=" * 50 + "\n")
 
     if include_val:
-        return data_phase1, data_phase2, data_val, test_data
+        return data_phase1, data_phase1_val, data_phase2, data_val, test_data
     return data_phase1, data_phase2, test_data

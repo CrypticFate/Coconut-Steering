@@ -45,7 +45,9 @@ class Config:
         self.vector_method = "dom"
         self.compute_cpca = True
         self.cpca_beta = 0.5
+        self.cpca_beta_sweep = [0.0, 0.3, 0.5, 0.7, 1.0]
         self.cpca_k_values = [1, 2, 5, 10]
+        self.cpca_probe_k = 10
         self.linear_probe_test_size = 0.2
 
         # Phase 3: gradient-based alpha tuning on D_val.
@@ -55,7 +57,8 @@ class Config:
         self.alpha_max_epochs = 3
         self.alpha_patience = 5
         self.alpha_tune_fraction = 0.9
-        self.lambda_align = 0.1
+        # Keep alignment regularizer disabled; optimize L_ans + λ_m * L_mag.
+        self.lambda_align = 0.0
         self.lambda_mag = 0.01
         self.gradient_check_epsilon = 1e-2
         self.gradient_check_max_rel_error = 0.05
